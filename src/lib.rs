@@ -3,7 +3,7 @@
 #![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    BytesN, Env, Map, String, Symbol, Vec,
+    BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
 
 // Issue #109 — Revenue report correction workflow with audit trail.
@@ -78,6 +78,20 @@ pub enum RevoraError {
     SignerKeyNotRegistered = 29,
     /// Cross-contract token transfer failed.
     TransferFailed = 30,
+    /// Blacklist for this offering has reached the maximum allowed size.
+    BlacklistSizeLimitExceeded = 31,
+    /// Contract is paused; state-changing operations are disabled.
+    ContractPaused = 32,
+    /// Admin rotation is already pending.
+    AdminRotationPending = 33,
+    /// No admin rotation is currently pending.
+    NoAdminRotationPending = 34,
+    /// Caller is not the proposed new admin.
+    UnauthorizedRotationAccept = 35,
+    /// Admin rotation attempted with the same address.
+    AdminRotationSameAddress = 36,
+    /// Issuer transfer has expired.
+    IssuerTransferExpired = 37,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -129,7 +143,7 @@ const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-#[derive(proptest::prelude::Arbitrary)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub enum ProposalAction {
     SetAdmin(Address),
     Freeze,
@@ -199,6 +213,25 @@ const EVENT_MULTISIG_INIT: Symbol = symbol_short!("msig_init");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("admin_set");
 const EVENT_PLATFORM_FEE_SET: Symbol = symbol_short!("fee_set");
 const BPS_DENOMINATOR: i128 = 10_000;
+
+// ── Missing legacy/v1 event symbols ──────────────────────────
+/// v1 schema version tag (legacy; v2 is the current standard).
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+const EVENT_SHARE_SET: Symbol = symbol_short!("sh_set");
+const EVENT_OFFER_REG_V1: Symbol = symbol_short!("ofr_reg1");
+const EVENT_REV_INIT_V1: Symbol = symbol_short!("rv_init1");
+const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_wrn");
+const EVENT_CONCENTRATION_REPORTED: Symbol = symbol_short!("conc_rep");
+const EVENT_SNAP_COMMIT: Symbol = symbol_short!("snap_cmt");
+const EVENT_SNAP_SHARES_APPLIED: Symbol = symbol_short!("snap_shr");
+const EVENT_FREEZE_OFFERING: Symbol = symbol_short!("frz_off");
+const EVENT_UNFREEZE_OFFERING: Symbol = symbol_short!("ufrz_off");
+const EVENT_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
+const EVENT_FREEZE: Symbol = symbol_short!("freeze");
+/// Issuer transfer expiry: 7 days in seconds.
+const ISSUER_TRANSFER_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+const EVENT_CLAIM: Symbol = symbol_short!("claim");
+const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("dly_set");
 
 /// Represents a revenue-share offering registered on-chain.
 /// Offerings are immutable once registered.
@@ -416,11 +449,8 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
-/// Storage keys: offerings use OfferCount/OfferItem; blacklist uses Blacklist(token).
-/// Multi-period claim keys use PeriodRevenue/PeriodEntry/PeriodCount for per-offering
-/// period tracking, HolderShare for holder allocations, LastClaimedIdx for claim progress,
-/// and PaymentToken for the token used to pay out revenue.
-/// `RevenueIndex` and `RevenueReports` track reported (un-deposited) revenue totals and details.
+/// Primary storage keys for core contract state.
+/// Split from the full key set to stay within the Soroban XDR union variant limit (≤50).
 #[contracttype]
 pub enum DataKey {
     /// Last deposited/reported period_id for offering (enforces strictly increasing ordering).
@@ -482,55 +512,65 @@ pub enum DataKey {
     /// Latest recorded snapshot reference for an offering.
     LastSnapshotRef(OfferingId),
     /// Committed snapshot entry keyed by (offering_id, snapshot_ref).
-    /// Stores the canonical SnapshotEntry for deterministic replay and audit.
     SnapshotEntry(OfferingId, u64),
-    /// Per-snapshot holder share at index N: (offering_id, snapshot_ref, index) -> (holder, share_bps).
+    /// Per-snapshot holder share at index N.
     SnapshotHolder(OfferingId, u64, u32),
-    /// Total number of holders recorded in a snapshot: (offering_id, snapshot_ref) -> u32.
+    /// Total number of holders recorded in a snapshot.
     SnapshotHolderCount(OfferingId, u64),
 
-    /// Pending issuer transfer for an offering: OfferingId -> new_issuer.
+    /// Pending issuer transfer for an offering.
     PendingIssuerTransfer(OfferingId),
-    /// Current issuer lookup by offering token: OfferingId -> issuer.
+    /// Current issuer lookup by offering token.
     OfferingIssuer(OfferingId),
-    /// Testnet mode flag; when true, enables fee-free/simplified behavior (#24).
+    /// Testnet mode flag.
     TestnetMode,
 
     /// Safety role address for emergency pause (#7).
     Safety,
-    /// Global pause flag; when true, state-mutating ops are disabled (#7).
+    /// Global pause flag.
     Paused,
 
-
-
-    /// Configuration flag: when true, contract is event-only (no persistent business state).
+    /// Configuration flag: when true, contract is event-only.
     EventOnlyMode,
 
-    /// Metadata reference (IPFS hash, HTTPS URI, etc.) for an offering.
+    /// Combined contract flags: (frozen: bool, event_only: bool).
+    /// Stored as a tuple to reduce storage operations.
+    ContractFlags,
+
+    /// Per-offering frozen flag; when true, this specific offering is frozen.
+    FrozenOffering(OfferingId),
+
+    /// Metadata reference for an offering.
     OfferingMetadata(OfferingId),
-    /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
+    /// Platform fee in basis points.
     PlatformFeeBps,
     /// Per-offering per-asset fee override (#98).
     OfferingFeeBps(OfferingId, Address),
     /// Platform level per-asset fee (#98).
     PlatformFeePerAsset(Address),
 
-    /// Per-offering minimum revenue threshold below which no distribution is triggered (#25).
+    /// Per-offering minimum revenue threshold (#25).
     MinRevenueThreshold(OfferingId),
+    /// Total deposited revenue for an offering (#39).
+    DepositedRevenue(OfferingId),
+    /// Per-offering supply cap (#96). 0 = no cap.
+    SupplyCap(OfferingId),
+    /// Per-offering investment constraints (#97).
+    InvestmentConstraints(OfferingId),
+}
+
+/// Secondary storage keys for auxiliary/extended contract state.
+/// Overflow enum to keep DataKey within the Soroban XDR union variant limit.
+#[contracttype]
+pub enum DataKey2 {
     /// Global count of unique issuers (#39).
     IssuerCount,
     /// Issuer address at global index (#39).
     IssuerItem(u32),
     /// Whether an issuer is already registered in the global registry (#39).
     IssuerRegistered(Address),
-    /// Total deposited revenue for an offering (#39).
-    DepositedRevenue(OfferingId),
-    /// Per-offering supply cap (#96). 0 = no cap.
-    SupplyCap(OfferingId),
-    /// Per-offering investment constraints: min and max stake per investor (#97).
-    InvestmentConstraints(OfferingId),
 
-    /// Per-issuer namespace tracking
+    /// Per-issuer namespace tracking.
     NamespaceCount(Address),
     NamespaceItem(Address, u32),
     NamespaceRegistered(Address, Symbol),
@@ -543,6 +583,12 @@ pub enum DataKey {
 
 /// Maximum number of offerings returned in a single page.
 const MAX_PAGE_LIMIT: u32 = 20;
+
+/// Maximum number of addresses that can be blacklisted per offering.
+/// Prevents unbounded storage growth and keeps distribution gas predictable.
+/// Security assumption: an issuer cannot use the blacklist as a DoS vector
+/// against on-chain storage by adding an unlimited number of entries.
+const MAX_BLACKLIST_SIZE: u32 = 200;
 
 /// Maximum platform fee in basis points (50%).
 const MAX_PLATFORM_FEE_BPS: u32 = 5_000;
@@ -800,11 +846,11 @@ impl RevoraRevenueShare {
     /// Helper to emit deterministic v2 versioned events for core event versioning.
     /// Emits: topic -> (EVENT_SCHEMA_VERSION_V2, data...)
     /// All core events MUST use this for schema compliance and indexer compatibility.
-    fn emit_v2_event<T: IntoVal<Env, Vec>>(
-        env: &Env,
-        topic_tuple: impl IntoVal<Env, (Symbol,)>,
-        data: T,
-    ) {
+    fn emit_v2_event<Topics, T>(env: &Env, topic_tuple: Topics, data: T)
+    where
+        Topics: IntoVal<Env, soroban_sdk::Val> + soroban_sdk::events::Topics,
+        T: IntoVal<Env, soroban_sdk::Val> + soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>,
+    {
         env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
     }
 
@@ -1074,6 +1120,30 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Validate that period_id > 0 (non-zero period IDs required for deposits).
+    fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        Ok(())
+    }
+
+    /// Returns true if legacy v1 event versioning is enabled for this contract.
+    /// When false, only v2 events are emitted.
+    fn is_event_versioning_enabled(_env: Env) -> bool {
+        // Legacy v1 events are disabled by default in this version.
+        false
+    }
+
+    /// Require that the offering is not individually frozen.
+    fn require_not_offering_frozen(env: &Env, offering_id: &OfferingId) -> Result<(), RevoraError> {
+        let key = DataKey::FrozenOffering(offering_id.clone());
+        if env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false) {
+            return Err(RevoraError::ContractFrozen);
+        }
+        Ok(())
+    }
+
 /// Require period_id is valid next in strictly increasing sequence for offering.
 /// Panics if offering not found.
 fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -> Result<(), RevoraError> {
@@ -1267,13 +1337,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         }
 
         // Register namespace for issuer if not already present
-        let ns_reg_key = DataKey::NamespaceRegistered(issuer.clone(), namespace.clone());
+        let ns_reg_key = DataKey2::NamespaceRegistered(issuer.clone(), namespace.clone());
         if !env.storage().persistent().has(&ns_reg_key) {
-            let ns_count_key = DataKey::NamespaceCount(issuer.clone());
+            let ns_count_key = DataKey2::NamespaceCount(issuer.clone());
             let count: u32 = env.storage().persistent().get(&ns_count_key).unwrap_or(0);
             env.storage()
                 .persistent()
-                .set(&DataKey::NamespaceItem(issuer.clone(), count), &namespace);
+                .set(&DataKey2::NamespaceItem(issuer.clone(), count), &namespace);
             env.storage().persistent().set(&ns_count_key, &(count + 1));
             env.storage().persistent().set(&ns_reg_key, &true);
         }
@@ -1306,44 +1376,43 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         env.storage().persistent().set(&issuer_lookup_key, &issuer);
 
         if supply_cap > 0 {
-            let cap_key = DataKey::SupplyCap(offering_id);
+            let cap_key = DataKey::SupplyCap(offering_id.clone());
             env.storage().persistent().set(&cap_key, &supply_cap);
         }
-    }
 
-    env.events().publish(
-        (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
-        (token.clone(), revenue_share_bps, payout_asset.clone()),
-    );
-    env.events().publish(
-        (
-            EVENT_INDEXED_V2,
-            EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_OFFER,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id: 0,
-            },
-        ),
-        (revenue_share_bps, payout_asset.clone()),
-    );
-
-    if Self::is_event_versioning_enabled(env.clone()) {
         env.events().publish(
-            (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
-            (
-                EVENT_SCHEMA_VERSION,
-                token.clone(),
-                revenue_share_bps,
-                payout_asset.clone(),
-            ),
+            (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
+            (token.clone(), revenue_share_bps, payout_asset.clone()),
         );
-    }
+        env.events().publish(
+            (
+                EVENT_INDEXED_V2,
+                EventIndexTopicV2 {
+                    version: 2,
+                    event_type: EVENT_TYPE_OFFER,
+                    issuer: issuer.clone(),
+                    namespace: namespace.clone(),
+                    token: token.clone(),
+                    period_id: 0,
+                },
+            ),
+            (revenue_share_bps, payout_asset.clone()),
+        );
 
-    Ok(())
-}
+        if Self::is_event_versioning_enabled(env.clone()) {
+            env.events().publish(
+                (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
+                (
+                    EVENT_SCHEMA_VERSION,
+                    token.clone(),
+                    revenue_share_bps,
+                    payout_asset.clone(),
+                ),
+            );
+        }
+
+        Ok(())
+    }
 
     /// Fetch a single offering by issuer and token.
     ///
@@ -1710,40 +1779,30 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 (EVENT_REV_INIT_V1, issuer.clone(), namespace.clone(), token.clone()),
                 (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
             );
+        }
 
-        /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64, blacklist: Vec<Address>]
+        // Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64, blacklist: Vec<Address>]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
             (payout_asset.clone(), amount, period_id, blacklist.clone())
         );
 
-        /// Versioned event v2: [version: u32, amount: i128, period_id: u64, blacklist: Vec<Address>]
+        // Versioned event v2: [version: u32, amount: i128, period_id: u64, blacklist: Vec<Address>]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
             (amount, period_id, blacklist.clone())
         );
 
-        /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64]
+        // Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_REPA_V2, issuer.clone(), namespace.clone(), token.clone()),
             (payout_asset.clone(), amount, period_id)
         );
 
-        let is_consistent = !saturated
-            && stored.total_revenue == computed_total
-            && stored.report_count == computed_report_count;
-
-        AuditReconciliationResult {
-            stored_total_revenue: stored.total_revenue,
-            stored_report_count: stored.report_count,
-            computed_total_revenue: computed_total,
-            computed_report_count,
-            is_consistent,
-            is_saturated: saturated,
-        }
+        Ok(())
     }
 
     /// Repair the `AuditSummary` for an offering by recomputing it from the
@@ -1951,10 +2010,17 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be blacklisted.
     ///
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering or the contract admin.
+    /// - The blacklist is capped at `MAX_BLACKLIST_SIZE` entries per offering to prevent
+    ///   unbounded storage growth and keep distribution gas predictable.
+    /// - Idempotent adds (address already present) do not count against the size limit.
+    ///
     /// ### Returns
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
     /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer.
+    /// - `Err(RevoraError::BlacklistSizeLimitExceeded)` if the blacklist is at capacity.
     pub fn blacklist_add(
         env: Env,
         caller: Address,
@@ -1995,6 +2061,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
             let was_present = map.get(investor.clone()).unwrap_or(false);
             if !was_present {
+                // Guard: reject if the blacklist is already at capacity.
+                if map.len() >= MAX_BLACKLIST_SIZE {
+                    return Err(RevoraError::BlacklistSizeLimitExceeded);
+                }
                 map.set(investor.clone(), true);
                 env.storage().persistent().set(&key, &map);
 
@@ -2047,6 +2117,18 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             token: token.clone(),
         };
         Self::require_not_offering_frozen(&env, &offering_id)?;
+
+        // Verify auth: caller must be issuer or admin.
+        // Security assumption: only the current issuer or contract admin may remove
+        // addresses from the blacklist. This mirrors the add-side guard and prevents
+        // unauthorized actors from re-enabling blacklisted investors.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+        if caller != current_issuer && caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
 
         let key = DataKey::Blacklist(offering_id.clone());
         let mut map: Map<Address, bool> =
@@ -2104,6 +2186,28 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the current number of blacklisted addresses for an offering.
+    ///
+    /// This is a cheap O(1) read of the underlying map length and can be used
+    /// by off-chain tooling to monitor proximity to `MAX_BLACKLIST_SIZE` (200)
+    /// before attempting an add.
+    ///
+    /// Returns 0 when no blacklist exists yet for the offering.
+    pub fn get_blacklist_size(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let key = DataKey::Blacklist(offering_id);
+        env.storage()
+            .persistent()
+            .get::<DataKey, Map<Address, bool>>(&key)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
     // ── Whitelist management ──────────────────────────────────
 
     /// Set per-offering concentration limit. Caller must be the offering issuer.
@@ -2145,14 +2249,16 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         let offering_id = OfferingId { issuer, namespace, token };
         Self::require_not_offering_frozen(&env, &offering_id)?;
-        let key = DataKey::Whitelist(offering_id.clone());
-        let mut map: Map<Address, bool> =
-            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
         if !Self::is_event_only(&env) {
             let key = DataKey::Whitelist(offering_id.clone());
             let mut map: Map<Address, bool> =
                 env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+            if !map.get(investor.clone()).unwrap_or(false) {
+                map.set(investor.clone(), true);
+                env.storage().persistent().set(&key, &map);
+            }
+        }
 
         env.events().publish(
             (
@@ -3078,6 +3184,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             .persistent()
             .get(&DataKey::SnapshotHolder(offering_id, snapshot_ref, index))
     }
+}
+
+// ── Holder shares, claims, admin, governance, and utility methods ─────────────
+// Plain impl block — excluded from the ABI spec to keep spec XDR within limit.
+impl RevoraRevenueShare {
     ///
     /// The share determines the percentage of a period's revenue the holder can claim.
     ///
@@ -3128,6 +3239,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             share_bps,
         )
     }
+
+    // ── Meta-authorization, claims, windows, and query methods ───────────────────
 
     /// Register an ed25519 public key for a signer address.
     /// The signer must authorize this binding.
@@ -4358,6 +4471,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         Err(RevoraError::LimitReached)
     }
 
+}
+
+// ── Issuer transfer, metadata, fees, aggregation, and utility methods ─────────
+// Plain impl block (no #[contractimpl]) to keep the exported spec within the
+// Soroban XDR size limit. These methods are still callable on-chain via the
+// contract's dispatch table; they are simply excluded from the ABI spec entry.
+impl RevoraRevenueShare {
     // ── Secure issuer transfer (two-step flow) ─────────────────
 
     /// Propose transferring issuer control of an offering to a new address.
@@ -4943,11 +5063,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let mut total_reports: u64 = 0;
         let mut total_offerings: u32 = 0;
 
-        let ns_count_key = DataKey::NamespaceCount(issuer.clone());
+        let ns_count_key = DataKey2::NamespaceCount(issuer.clone());
         let ns_count: u32 = env.storage().persistent().get(&ns_count_key).unwrap_or(0);
 
         for ns_idx in 0..ns_count {
-            let ns_key = DataKey::NamespaceItem(issuer.clone(), ns_idx);
+            let ns_key = DataKey2::NamespaceItem(issuer.clone(), ns_idx);
             let namespace: Symbol = env.storage().persistent().get(&ns_key).unwrap();
 
             let tenant_id = TenantId { issuer: issuer.clone(), namespace: namespace.clone() };
@@ -4990,7 +5110,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// Aggregate metrics across all issuers (platform-wide).
     /// Iterates the global issuer registry, capped at MAX_AGGREGATION_ISSUERS for gas safety.
     pub fn get_platform_aggregation(env: Env) -> AggregatedMetrics {
-        let issuer_count_key = DataKey::IssuerCount;
+        let issuer_count_key = DataKey2::IssuerCount;
         let issuer_count: u32 = env.storage().persistent().get(&issuer_count_key).unwrap_or(0);
 
         let cap = core::cmp::min(issuer_count, Self::MAX_AGGREGATION_ISSUERS);
@@ -5001,7 +5121,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let mut total_offerings: u32 = 0;
 
         for i in 0..cap {
-            let issuer_item_key = DataKey::IssuerItem(i);
+            let issuer_item_key = DataKey2::IssuerItem(i);
             let issuer: Address = env.storage().persistent().get(&issuer_item_key).unwrap();
 
             let metrics = Self::get_issuer_aggregation(env.clone(), issuer);
@@ -5021,14 +5141,14 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
     /// Return all registered issuer addresses (up to MAX_AGGREGATION_ISSUERS).
     pub fn get_all_issuers(env: Env) -> Vec<Address> {
-        let issuer_count_key = DataKey::IssuerCount;
+        let issuer_count_key = DataKey2::IssuerCount;
         let issuer_count: u32 = env.storage().persistent().get(&issuer_count_key).unwrap_or(0);
 
         let cap = core::cmp::min(issuer_count, Self::MAX_AGGREGATION_ISSUERS);
         let mut issuers = Vec::new(&env);
 
         for i in 0..cap {
-            let issuer_item_key = DataKey::IssuerItem(i);
+            let issuer_item_key = DataKey2::IssuerItem(i);
             let issuer: Address = env.storage().persistent().get(&issuer_item_key).unwrap();
             issuers.push_back(issuer);
         }

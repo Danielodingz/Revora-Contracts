@@ -1649,7 +1649,173 @@ fn blacklist_remove_requires_issuer_auth() {
     assert!(r.is_ok());
 }
 
-// ── whitelist CRUD ────────────────────────────────────────────
+// ── Blacklist size guardrails ─────────────────────────────────
+
+/// Adding exactly MAX_BLACKLIST_SIZE (200) distinct addresses must succeed.
+#[test]
+fn blacklist_at_capacity_succeeds() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+
+    for _ in 0..200 {
+        let inv = Address::generate(&env);
+        let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv);
+        assert!(r.is_ok(), "expected Ok for entry within limit");
+    }
+    assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 200);
+}
+
+/// Adding a 201st distinct address must be rejected with BlacklistSizeLimitExceeded.
+#[test]
+fn blacklist_over_capacity_rejected() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+
+    for _ in 0..200 {
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
+    }
+
+    let overflow = Address::generate(&env);
+    let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &overflow);
+    assert!(r.is_err());
+    assert_eq!(r.unwrap_err(), RevoraError::BlacklistSizeLimitExceeded);
+}
+
+/// Idempotent re-add of an already-blacklisted address must not count against the limit.
+#[test]
+fn blacklist_idempotent_add_does_not_consume_capacity() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    let inv = Address::generate(&env);
+
+    // Fill to 199
+    for _ in 0..199 {
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
+    }
+    // Add inv once (now at 200)
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv);
+    assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 200);
+
+    // Re-adding inv must succeed (idempotent, no new slot consumed)
+    let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv);
+    assert!(r.is_ok(), "idempotent re-add must not be rejected");
+    assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 200);
+}
+
+/// After removing an entry from a full blacklist, a new address can be added again.
+#[test]
+fn blacklist_remove_frees_capacity() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    let first = Address::generate(&env);
+
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &first);
+    for _ in 0..199 {
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
+    }
+    assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 200);
+
+    // At capacity — new add must fail
+    let overflow = Address::generate(&env);
+    assert!(client
+        .try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &overflow)
+        .is_err());
+
+    // Remove one entry
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &first);
+    assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 199);
+
+    // Now the previously-rejected address can be added
+    let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &overflow);
+    assert!(r.is_ok(), "add after remove must succeed");
+}
+
+/// Size limit is per-offering; filling one offering's blacklist must not affect another.
+#[test]
+fn blacklist_size_limit_is_per_offering() {
+    let (env, client, _admin, issuer, token_a) = blacklist_setup();
+    let token_b = Address::generate(&env);
+    let payout_b = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("def"), &token_b, &1_000, &payout_b, &0);
+
+    // Fill token_a blacklist to capacity
+    for _ in 0..200 {
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token_a, &Address::generate(&env));
+    }
+
+    // token_b blacklist is independent — must still accept entries
+    let inv = Address::generate(&env);
+    let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token_b, &inv);
+    assert!(r.is_ok(), "separate offering blacklist must be unaffected");
+}
+
+/// get_blacklist_size returns 0 before any add.
+#[test]
+fn get_blacklist_size_empty() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    let _ = env;
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 0);
+}
+
+/// get_blacklist_size tracks additions and removals accurately.
+#[test]
+fn get_blacklist_size_tracks_mutations() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_a);
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 1);
+
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_b);
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 2);
+
+    // Idempotent re-add must not change size
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_a);
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 2);
+
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &inv_a);
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 1);
+}
+
+/// get_blacklist_size at capacity equals MAX_BLACKLIST_SIZE (200).
+#[test]
+fn get_blacklist_size_at_capacity() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    for _ in 0..200 {
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
+    }
+    assert_eq!(client.get_blacklist_size(&issuer, &symbol_short!("def"), &token), 200);
+}
+
+/// blacklist_remove must reject callers that are neither issuer nor admin.
+#[test]
+fn blacklist_remove_requires_issuer_or_admin_auth() {
+    let (env, client, _admin, issuer, token) = blacklist_setup();
+    let investor = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
+
+    // Attacker cannot remove
+    let r = client.try_blacklist_remove(&attacker, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err(), "unauthorized remove must be rejected");
+
+    // Investor must still be blacklisted after failed remove
+    assert!(client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor),
+        "blacklist must be unchanged after unauthorized remove attempt");
+}
+
+/// blacklist_remove on a non-existent offering must return OfferingNotFound.
+#[test]
+fn blacklist_remove_nonexistent_offering_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let r = client.try_blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err(), "remove on non-existent offering must fail");
+}
 
 #[test]
 fn whitelist_add_marks_investor_as_whitelisted() {

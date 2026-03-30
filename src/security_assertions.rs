@@ -404,6 +404,26 @@ pub mod state_consistency {
         Ok(())
     }
 
+    /// Assert that the blacklist has not reached its maximum allowed size.
+    ///
+    /// # Security Assumption
+    /// Prevents issuers from using the blacklist as an unbounded storage sink.
+    /// The limit is enforced per-offering; different offerings have independent caps.
+    ///
+    /// # Parameters
+    /// - `current_size`: current number of entries in the blacklist.
+    /// - `max_size`: the configured maximum (typically `MAX_BLACKLIST_SIZE`).
+    ///
+    /// # Returns
+    /// - `Ok(())` if `current_size < max_size`
+    /// - `Err(BlacklistSizeLimitExceeded)` if the blacklist is at or above capacity
+    pub fn assert_blacklist_not_full(current_size: u32, max_size: u32) -> Result<(), RevoraError> {
+        if current_size >= max_size {
+            return Err(RevoraError::BlacklistSizeLimitExceeded);
+        }
+        Ok(())
+    }
+
     /// Assert that payment token matches expected token.
     ///
     /// # Returns
@@ -521,29 +541,29 @@ pub mod abort_handling {
     /// let result = contract.register_offering(...);
     /// assert_operation_fails(result, RevoraError::InvalidRevenueShareBps)?;
     /// ```
-    pub fn assert_operation_fails(
-        result: Result<impl std::fmt::Debug, RevoraError>,
+    ///
+    /// Note: only available outside WASM (test/host contexts) because it requires
+    /// `std::fmt::Debug` and `format!` which are not available in `no_std`.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn assert_operation_fails<T: core::fmt::Debug>(
+        result: Result<T, RevoraError>,
         expected_error: RevoraError,
-    ) -> Result<(), String> {
+    ) -> Result<(), &'static str> {
         match result {
             Err(actual) if actual == expected_error => Ok(()),
-            Err(actual) => Err(format!(
-                "Expected {:?} but got {:?}",
-                expected_error, actual
-            )),
-            Ok(ok) => Err(format!(
-                "Expected error {:?} but operation succeeded: {:?}",
-                expected_error, ok
-            )),
+            _ => Err("unexpected result"),
         }
     }
 
     /// Assertion that an operation should have succeeded.
     /// Used in testing to verify happy path execution.
-    pub fn assert_operation_succeeds<T: std::fmt::Debug>(
+    ///
+    /// Note: only available outside WASM (test/host contexts).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn assert_operation_succeeds<T>(
         result: Result<T, RevoraError>,
-    ) -> Result<T, String> {
-        result.map_err(|e| format!("Operation failed with: {:?}", e))
+    ) -> Result<T, &'static str> {
+        result.map_err(|_| "operation failed unexpectedly")
     }
 
     /// Recover from a recoverable error by providing a default value.
@@ -589,10 +609,6 @@ pub mod abort_handling {
             | IssuerTransferPending
             | NoTransferPending
             | UnauthorizedTransferAccept
-            | AdminRotationPending
-            | NoAdminRotationPending
-            | UnauthorizedRotationAccept
-            | AdminRotationSameAddress
             | SignatureReplay
             | SignerKeyNotRegistered
             | HolderBlacklisted
@@ -602,7 +618,17 @@ pub mod abort_handling {
             | SnapshotNotEnabled
             | PayoutAssetMismatch
             | MetadataTooLarge
-            | SupplyCapExceeded => false,
+            | SupplyCapExceeded
+            | TransferFailed
+            // Blacklist capacity is a hard enforcement boundary; callers must
+            // remove an entry before retrying — not safe to silently continue.
+            | BlacklistSizeLimitExceeded
+            | ContractPaused
+            | AdminRotationPending
+            | NoAdminRotationPending
+            | UnauthorizedRotationAccept
+            | AdminRotationSameAddress
+            | IssuerTransferExpired => false,
         }
     }
 
@@ -855,6 +881,28 @@ mod tests {
                 Err(RevoraError::ContractFrozen)
             );
         }
+
+        #[test]
+        fn test_assert_blacklist_not_full_below_limit() {
+            assert!(state_consistency::assert_blacklist_not_full(0, 200).is_ok());
+            assert!(state_consistency::assert_blacklist_not_full(199, 200).is_ok());
+        }
+
+        #[test]
+        fn test_assert_blacklist_not_full_at_limit() {
+            assert_eq!(
+                state_consistency::assert_blacklist_not_full(200, 200),
+                Err(RevoraError::BlacklistSizeLimitExceeded)
+            );
+        }
+
+        #[test]
+        fn test_assert_blacklist_not_full_above_limit() {
+            assert_eq!(
+                state_consistency::assert_blacklist_not_full(201, 200),
+                Err(RevoraError::BlacklistSizeLimitExceeded)
+            );
+        }
     }
 
     mod abort_handling_tests {
@@ -871,6 +919,22 @@ mod tests {
         fn test_is_recoverable_error_concentration_exceeded() {
             assert!(!abort_handling::is_recoverable_error(
                 &RevoraError::ConcentrationLimitExceeded
+            ));
+        }
+
+        #[test]
+        fn test_is_recoverable_error_blacklist_size_limit_exceeded() {
+            // BlacklistSizeLimitExceeded is fatal: caller must remove an entry
+            // before retrying; silently continuing would bypass the guardrail.
+            assert!(!abort_handling::is_recoverable_error(
+                &RevoraError::BlacklistSizeLimitExceeded
+            ));
+        }
+
+        #[test]
+        fn test_is_recoverable_error_transfer_failed() {
+            assert!(!abort_handling::is_recoverable_error(
+                &RevoraError::TransferFailed
             ));
         }
 
