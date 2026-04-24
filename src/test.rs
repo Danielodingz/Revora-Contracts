@@ -74,10 +74,7 @@ fn test_initialize_rejects_double_init() {
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
     let result = client.try_initialize(&admin, &token_id);
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::AlreadyInitialized))
-    );
+    assert_eq!(result, Err(Ok(ContractError::AlreadyInitialized)));
 }
 
 // ─── 2. Period creation ───────────────────────────────────────────────────────
@@ -195,6 +192,14 @@ fn test_create_period_accepts_adjacent_non_overlapping() {
     let (env, contract_id, _token_id, _admin) = setup();
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
+    let id0 = client.create_period(&100u32, &200u32, &1_000i128);
+    let id1 = client.create_period(&201u32, &300u32, &1_500i128);
+
+    assert_eq!(id0, 0);
+    assert_eq!(id1, 1);
+    assert_eq!(client.get_period_ids().len(), 2);
+}
+
 #[test]
 fn test_create_period_unauthorized() {
     let (env, contract_id, _token_id, _admin) = setup();
@@ -256,10 +261,7 @@ fn test_add_beneficiary_period_not_found() {
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
     let b = Address::generate(&env);
-    assert_eq!(
-        client.try_add_beneficiary(&99u32, &b),
-        Err(Ok(ContractError::PeriodNotFound))
-    );
+    assert_eq!(client.try_add_beneficiary(&99u32, &b), Err(Ok(ContractError::PeriodNotFound)));
 }
 
 #[test]
@@ -397,10 +399,7 @@ fn test_claim_period_not_ended() {
     client.add_beneficiary(&period_id, &b);
 
     // Ledger is at default (0) — before period ends
-    assert_eq!(
-        client.try_claim(&period_id, &b),
-        Err(Ok(ContractError::PeriodNotEnded))
-    );
+    assert_eq!(client.try_claim(&period_id, &b), Err(Ok(ContractError::PeriodNotEnded)));
 }
 
 #[test]
@@ -424,10 +423,7 @@ fn test_claim_at_exact_end_ledger_rejected() {
         max_entry_ttl: 6_312_000,
     });
 
-    assert_eq!(
-        client.try_claim(&period_id, &b),
-        Err(Ok(ContractError::PeriodNotEnded))
-    );
+    assert_eq!(client.try_claim(&period_id, &b), Err(Ok(ContractError::PeriodNotEnded)));
 }
 
 #[test]
@@ -442,10 +438,7 @@ fn test_claim_double_claim_rejected() {
 
     client.claim(&period_id, &b);
 
-    assert_eq!(
-        client.try_claim(&period_id, &b),
-        Err(Ok(ContractError::AlreadyClaimed))
-    );
+    assert_eq!(client.try_claim(&period_id, &b), Err(Ok(ContractError::AlreadyClaimed)));
 }
 
 #[test]
@@ -460,10 +453,7 @@ fn test_claim_non_beneficiary_rejected() {
     advance_past(&env, 200);
 
     let stranger = Address::generate(&env);
-    assert_eq!(
-        client.try_claim(&period_id, &stranger),
-        Err(Ok(ContractError::NotBeneficiary))
-    );
+    assert_eq!(client.try_claim(&period_id, &stranger), Err(Ok(ContractError::NotBeneficiary)));
 }
 
 #[test]
@@ -472,10 +462,7 @@ fn test_claim_period_not_found() {
     let client = RevenueDepositContractClient::new(&env, &contract_id);
     let b = Address::generate(&env);
 
-    assert_eq!(
-        client.try_claim(&99u32, &b),
-        Err(Ok(ContractError::PeriodNotFound))
-    );
+    assert_eq!(client.try_claim(&99u32, &b), Err(Ok(ContractError::PeriodNotFound)));
 }
 
 #[test]
@@ -489,10 +476,7 @@ fn test_claim_no_beneficiaries() {
     advance_past(&env, 200);
 
     // No beneficiaries registered, but b tries to claim
-    assert_eq!(
-        client.try_claim(&period_id, &b),
-        Err(Ok(ContractError::NoBeneficiaries))
-    );
+    assert_eq!(client.try_claim(&period_id, &b), Err(Ok(ContractError::NoBeneficiaries)));
 }
 
 // ─── 5. Read helpers ──────────────────────────────────────────────────────────
@@ -502,10 +486,7 @@ fn test_get_period_not_found() {
     let (env, contract_id, _token_id, _admin) = setup();
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
-    assert_eq!(
-        client.try_get_period(&42u32),
-        Err(Ok(ContractError::PeriodNotFound))
-    );
+    assert_eq!(client.try_get_period(&42u32), Err(Ok(ContractError::PeriodNotFound)));
 }
 
 #[test]
@@ -577,10 +558,7 @@ fn test_claims_across_multiple_periods_independent() {
     assert_eq!(token.balance(&b2), 2_000);
 
     // b2 not in p1 — should be rejected
-    assert_eq!(
-        client.try_claim(&p1, &b2),
-        Err(Ok(ContractError::NotBeneficiary))
-    );
+    assert_eq!(client.try_claim(&p1, &b2), Err(Ok(ContractError::NotBeneficiary)));
 }
 
 #[test]
@@ -602,10 +580,7 @@ fn test_removing_beneficiary_before_claim_excludes_them() {
     assert_eq!(client.claim(&period_id, &b1), 6_000);
 
     // b2 was removed — cannot claim
-    assert_eq!(
-        client.try_claim(&period_id, &b2),
-        Err(Ok(ContractError::NotBeneficiary))
-    );
+    assert_eq!(client.try_claim(&period_id, &b2), Err(Ok(ContractError::NotBeneficiary)));
 }
 
 #[test]
@@ -1332,8 +1307,9 @@ fn set_concentration_limit_bounds_check() {
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
-    
-    let res = client.try_set_concentration_limit(&issuer, &symbol_short!("def"), &token, &10001, &false);
+
+    let res =
+        client.try_set_concentration_limit(&issuer, &symbol_short!("def"), &token, &10001, &false);
     assert!(res.is_err());
 }
 
@@ -1346,7 +1322,7 @@ fn report_concentration_bounds_check() {
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
-    
+
     let res = client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &10001);
     assert!(res.is_err());
 }
@@ -1363,9 +1339,10 @@ fn set_concentration_limit_respects_pause() {
     let payout_asset = Address::generate(&env);
     client.initialize(&admin, &None, &None::<bool>);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
-    
+
     client.pause_admin(&admin);
-    let res = client.try_set_concentration_limit(&issuer, &symbol_short!("def"), &token, &5000, &false);
+    let res =
+        client.try_set_concentration_limit(&issuer, &symbol_short!("def"), &token, &5000, &false);
     assert!(res.is_err());
 }
 
@@ -1381,7 +1358,7 @@ fn report_concentration_respects_pause() {
     let payout_asset = Address::generate(&env);
     client.initialize(&admin, &None, &None::<bool>);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
-    
+
     client.pause_admin(&admin);
     let res = client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &5000);
     assert!(res.is_err());
@@ -1397,10 +1374,10 @@ fn report_concentration_emits_audit_event() {
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
-    
+
     let before = env.events().all().len();
     client.report_concentration(&issuer, &symbol_short!("def"), &token, &3000);
-    
+
     let events = env.events().all();
     assert!(events.len() > before);
 }
@@ -1765,8 +1742,7 @@ fn compute_share_extreme_inputs_remain_bounded() {
     assert!(share <= amount);
 
     let negative_amount = i128::MIN;
-    let negative_share =
-        client.compute_share(&negative_amount, &9_999, &RoundingMode::RoundHalfUp);
+    let negative_share = client.compute_share(&negative_amount, &9_999, &RoundingMode::RoundHalfUp);
     assert!(negative_share <= 0);
     assert!(negative_share >= negative_amount);
 }
@@ -1833,7 +1809,7 @@ fn deposit_revenue_stores_period_data() {
 }
 
 #[test]
-fn register_offering_locks_payment_token_before_first_deposit() {
+fn register_offering_does_not_lock_payment_token_before_first_deposit() {
     let env = Env::default();
     env.mock_all_auths();
     let client = make_client(&env);
@@ -1850,10 +1826,7 @@ fn register_offering_locks_payment_token_before_first_deposit() {
         &0,
     );
 
-    assert_eq!(
-        client.get_payment_token(&issuer, &symbol_short!("def"), &offering_token),
-        Some(payout_asset)
-    );
+    assert_eq!(client.get_payment_token(&issuer, &symbol_short!("def"), &offering_token), None);
 }
 
 #[test]
@@ -1907,7 +1880,7 @@ fn deposit_revenue_fails_for_duplicate_period() {
         &100_000,
         &1,
     );
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(RevoraError::PeriodAlreadyDeposited)));
 }
 
 #[test]
@@ -1978,6 +1951,83 @@ fn first_deposit_uses_registered_payment_token_lock() {
         client.get_payment_token(&issuer, &symbol_short!("def"), &offering_token),
         Some(configured_asset)
     );
+}
+
+#[test]
+fn failed_first_deposit_does_not_lock_payment_token_or_consume_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+    let offering_token = Address::generate(&env);
+    let (payment_token, payment_token_admin) = create_payment_token(&env);
+
+    client.register_offering(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &5_000,
+        &payment_token,
+        &0,
+    );
+
+    let failed = client.try_deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+    assert_eq!(failed, Err(Ok(RevoraError::TransferFailed)));
+    assert_eq!(client.get_payment_token(&issuer, &symbol_short!("def"), &offering_token), None);
+    assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &offering_token), 0);
+
+    mint_tokens(&env, &payment_token, &payment_token_admin, &issuer, &1_000_000);
+    let retry = client.try_deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+    assert!(retry.is_ok());
+    assert_eq!(
+        client.get_payment_token(&issuer, &symbol_short!("def"), &offering_token),
+        Some(payment_token)
+    );
+    assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &offering_token), 1);
+}
+
+#[test]
+fn second_deposit_rejects_wrong_payment_token_without_mutating_state() {
+    let (env, client, issuer, token, payment_token, contract_id) = claim_setup();
+    let (wrong_payment_token, wrong_admin) = create_payment_token(&env);
+    mint_tokens(&env, &wrong_payment_token, &wrong_admin, &issuer, &1_000_000);
+
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+
+    let issuer_balance_before = balance(&env, &wrong_payment_token, &issuer);
+    let contract_balance_before = balance(&env, &wrong_payment_token, &contract_id);
+    let result = client.try_deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &wrong_payment_token,
+        &200_000,
+        &2,
+    );
+
+    assert_eq!(result, Err(Ok(RevoraError::PaymentTokenMismatch)));
+    assert_eq!(
+        client.get_payment_token(&issuer, &symbol_short!("def"), &token),
+        Some(payment_token)
+    );
+    assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 1);
+    assert_eq!(balance(&env, &wrong_payment_token, &issuer), issuer_balance_before);
+    assert_eq!(balance(&env, &wrong_payment_token, &contract_id), contract_balance_before);
 }
 
 #[test]
@@ -4862,15 +4912,14 @@ fn large_period_range_sums_correctly_full() {
 // PROPERTY-BASED INVARIANT TESTS (Hardened for production)
 // ===========================================================================
 
-use crate::proptest_helpers::{any_test_operation, TestOperation, arb_valid_operation_sequence, arb_strictly_increasing_periods};
+use crate::proptest_helpers::{
+    any_test_operation, arb_strictly_increasing_periods, arb_valid_operation_sequence,
+    TestOperation,
+};
 use soroban_sdk::testutils::Ledger as _;
 
 /// Enhanced invariant oracle: must hold after ANY sequence.
-fn check_invariants_enhanced(
-    env: &Env,
-    client: &RevoraRevenueShareClient,
-    issuers: &Vec<Address>,
-) {
+fn check_invariants_enhanced(env: &Env, client: &RevoraRevenueShareClient, issuers: &Vec<Address>) {
     for issuer in issuers.iter() {
         let ns = soroban_sdk::symbol_short!("def");
         let offerings_page = client.get_offerings_page(issuer, &ns, &0, &20);
@@ -4910,7 +4959,8 @@ fn check_invariants_enhanced(
             let conc_limit = client.get_concentration_limit(issuer, &ns, &offering.token);
             if let Some(cfg) = conc_limit {
                 if cfg.enforce {
-                    let current_conc = client.get_current_concentration(issuer, &ns, &offering.token).unwrap_or(0);
+                    let current_conc =
+                        client.get_current_concentration(issuer, &ns, &offering.token).unwrap_or(0);
                     assert!(current_conc <= cfg.max_bps, "concentration exceeded");
                 }
             }
@@ -4933,7 +4983,7 @@ proptest! {
     fn prop_period_ordering(env in Env::default(), seq in arb_valid_operation_sequence(&env, 20usize)) {
         let client = make_client(&env);
         let issuers = vec![&env, [Address::generate(&env)].to_vec()];
-        
+
         for op in seq {
             match op {
                 TestOperation::RegisterOffering((i, ns, t, bps, pa)) => {
@@ -4946,7 +4996,7 @@ proptest! {
                 _ => {}
             }
         }
-        
+
         check_invariants_enhanced(&env, &client, &issuers);
     }
 }
@@ -4959,10 +5009,10 @@ proptest! {
         let issuer = Address::generate(&env);
         let ns = symbol_short!("def");
         let token = Address::generate(&env);
-        
+
         client.register_offering(&issuer, &ns, &token, &1000, &token.clone(), &0);
         client.set_concentration_limit(&issuer, &ns, &token.clone(), &5000, &true);
-        
+
         // Over limit → report_revenue fails
         client.report_concentration(&issuer, &ns, &token.clone(), &6000);
         let result = client.try_report_revenue(&issuer, &ns, &token, &token, &1000, &1, &false);
@@ -4979,18 +5029,18 @@ proptest! {
         let owner2 = Address::generate(&env);
         let owner3 = Address::generate(&env);
         let caller = Address::generate(&env);
-        
+
         let mut owners = Vec::new(&env);
         owners.push_back(owner1.clone());
         owners.push_back(owner2.clone());
         owners.push_back(owner3.clone());
-        
+
         client.init_multisig(&caller, &owners, &2);
-        
+
         let p1 = client.propose_action(&owner1, &ProposalAction::Freeze);
         // Below threshold → fail
         prop_assert!(client.try_execute_action(&p1).is_err());
-        
+
         client.approve_action(&owner2, &p1);
         // Threshold met → succeeds
         prop_assert!(client.try_execute_action(&p1).is_ok());
@@ -5004,10 +5054,10 @@ proptest! {
         let client = make_client(&env);
         let admin = Address::generate(&env);
         let issuer = admin.clone();
-        
+
         client.initialize(&admin, &None::<Address>, &None::<bool>);
         client.pause_admin(&admin);
-        
+
         let token = Address::generate(&env);
         // Mutations panic post-pause
         let result = std::panic::catch_unwind(|| {
@@ -5022,7 +5072,6 @@ fn continuous_invariants_deterministic_reproducible() {
     // Existing test preserved
 }
 
-
 /// Property: Blacklist enforcement (blacklisted holders claim 0).
 proptest! {
     #[test]
@@ -5034,10 +5083,10 @@ proptest! {
         let (i, ns, t) = offering;
         let client = make_client(&env);
         client.register_offering(&i, &ns, &t, &1000, &t.clone(), &0);
-        
+
         // Blacklist holder
         client.blacklist_add(&i, &i, &ns, &t.clone(), &holder);
-        
+
         // Attempt claim
         let share_bps = 5000u32;
         client.set_holder_share(&i, &ns, &t.clone(), &holder, &share_bps);
@@ -5057,25 +5106,25 @@ proptest! {
         let client = make_client(&env);
         let issuer = Address::generate(&env);
         let ns = symbol_short!("def");
-        
+
         // Register exactly N offerings
         for _ in 0..n {
             let token = Address::generate(&env);
             client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
         }
-        
+
         assert_eq!(client.get_offering_count(&issuer, &ns), n as u32);
-        
+
         // Page 1: first 20 (or N)
         let (page1, cursor1) = client.get_offerings_page(&issuer, &ns, &0, &20);
         let page1_len = page1.len();
         assert!(page1_len <= 20);
-        
+
         if n > 20 {
             let (page2, cursor2) = client.get_offerings_page(&issuer, &ns, &cursor1.unwrap(), &20);
             assert_eq!(page1_len + page2.len(), core::cmp::min(40, n));
         }
-        
+
         // Full scan reconstructs all N
         let mut all_count = 0;
         let mut cursor: u32 = 0;
@@ -5102,14 +5151,14 @@ proptest! {
         let client = make_client(&env);
         let seed = 0xdeadbeefu64;
         let issuers = vec![&env, vec![&env, Address::generate(&env)]];
-        
+
         for step in 0..50 {
             let mut rng = seed.wrapping_add((step * 12345) as u64);
             let op = any_test_operation(&env).new_tree(&mut proptest::test_runner::rng::RngCoreAdapter::new(&mut rng)).unwrap();
-            
+
             // Execute op (mocked)
             // ... exec logic per TestOperation variant
-            
+
             // Oracle check after each step
             check_invariants_enhanced(&env, &client, &issuers);
         }
@@ -5127,7 +5176,6 @@ fn continuous_invariants_deterministic_reproducible() {
 
 #[test]
 fn calculate_distribution_basic() {
-
     let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
     let caller = Address::generate(&env);
 
@@ -6602,7 +6650,7 @@ mod regression {
     #[test]
     fn min_revenue_threshold_default_is_zero() {
         let env = Env::default();
-    let (client, issuer, token, _payout) = setup_with_offering(&env);
+        let (client, issuer, token, _payout) = setup_with_offering(&env);
         let threshold = client.get_min_revenue_threshold(&issuer, &symbol_short!("def"), &token);
         assert_eq!(threshold, 0);
     }
@@ -6610,7 +6658,7 @@ mod regression {
     #[test]
     fn set_min_revenue_threshold_emits_event() {
         let env = Env::default();
-    let (client, issuer, token, _payout) = setup_with_offering(&env);
+        let (client, issuer, token, _payout) = setup_with_offering(&env);
         let before = legacy_events(&env).len();
         client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &5_000);
         assert!(legacy_events(&env).len() > before);
@@ -6619,7 +6667,7 @@ mod regression {
     #[test]
     fn report_below_threshold_emits_event_and_skips_distribution() {
         let env = Env::default();
-    let (client, issuer, token, payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, payout_asset) = setup_with_offering(&env);
         client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &10_000);
         let events_before = legacy_events(&env).len();
         client.report_revenue(
@@ -6643,7 +6691,7 @@ mod regression {
     #[test]
     fn report_at_or_above_threshold_updates_state() {
         let env = Env::default();
-    let (client, issuer, token, payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, payout_asset) = setup_with_offering(&env);
         client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &1_000);
         client.report_revenue(
             &issuer,
@@ -6674,7 +6722,7 @@ mod regression {
     #[test]
     fn zero_threshold_disables_check() {
         let env = Env::default();
-    let (client, issuer, token, payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, payout_asset) = setup_with_offering(&env);
         client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &100);
         client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &0);
         client.report_revenue(
@@ -6775,7 +6823,7 @@ mod regression {
     #[test]
     fn get_offerings_page_order_is_by_registration_index() {
         let env = Env::default();
-    let (client, issuer) = setup(&env);
+        let (client, issuer) = setup(&env);
         let t0 = Address::generate(&env);
         let t1 = Address::generate(&env);
         let t2 = Address::generate(&env);
@@ -6899,7 +6947,7 @@ mod regression {
     #[test]
     fn get_version_unchanged_after_operations() {
         let env = Env::default();
-    let (client, issuer) = setup(&env);
+        let (client, issuer) = setup(&env);
         let v0 = client.get_version();
         let token = Address::generate(&env);
         let payout_asset = Address::generate(&env);
@@ -6922,7 +6970,9 @@ mod regression {
             &0,
             &1,
         );
-        assert!(r.is_err());
+        assert_eq!(r, Err(Ok(RevoraError::InvalidAmount)));
+        assert_eq!(client.get_payment_token(&issuer, &symbol_short!("def"), &token), None);
+        assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
     }
 
     #[test]
@@ -6936,7 +6986,9 @@ mod regression {
             &-1,
             &1,
         );
-        assert!(r.is_err());
+        assert_eq!(r, Err(Ok(RevoraError::InvalidAmount)));
+        assert_eq!(client.get_payment_token(&issuer, &symbol_short!("def"), &token), None);
+        assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
     }
 
     #[test]
@@ -6950,7 +7002,9 @@ mod regression {
             &100,
             &0,
         );
-        assert!(r.is_err());
+        assert_eq!(r, Err(Ok(RevoraError::InvalidPeriodId)));
+        assert_eq!(client.get_payment_token(&issuer, &symbol_short!("def"), &token), None);
+        assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
     }
 
     #[test]
@@ -6970,7 +7024,7 @@ mod regression {
     #[test]
     fn report_revenue_rejects_negative_amount() {
         let env = Env::default();
-    let (client, issuer, token, payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, payout_asset) = setup_with_offering(&env);
         let r = client.try_report_revenue(
             &issuer,
             &symbol_short!("def"),
@@ -6986,7 +7040,7 @@ mod regression {
     #[test]
     fn report_revenue_accepts_zero_amount() {
         let env = Env::default();
-    let (client, issuer, token, payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, payout_asset) = setup_with_offering(&env);
         let r = client.try_report_revenue(
             &issuer,
             &symbol_short!("def"),
@@ -7002,7 +7056,7 @@ mod regression {
     #[test]
     fn set_min_revenue_threshold_rejects_negative() {
         let env = Env::default();
-    let (client, issuer, token, _payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, _payout_asset) = setup_with_offering(&env);
         let r = client.try_set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &-1);
         assert!(r.is_err());
     }
@@ -7010,7 +7064,7 @@ mod regression {
     #[test]
     fn set_min_revenue_threshold_accepts_zero() {
         let env = Env::default();
-    let (client, issuer, token, _payout_asset) = setup_with_offering(&env);
+        let (client, issuer, token, _payout_asset) = setup_with_offering(&env);
         let r = client.try_set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &0);
         assert!(r.is_ok());
     }

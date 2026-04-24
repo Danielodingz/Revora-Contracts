@@ -6,6 +6,16 @@ use soroban_sdk::{
     BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
 
+mod revenue_deposit_contract;
+pub use revenue_deposit_contract::{
+    ContractError, Period, RevenueDepositContract, RevenueDepositContractClient,
+};
+
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_auth;
+
 // Issue #109 — Revenue report correction workflow with audit trail.
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
@@ -78,16 +88,26 @@ pub enum RevoraError {
     SignerKeyNotRegistered = 29,
     /// Multisig proposal has expired.
     ProposalExpired = 30,
-    /// Cross-contract token transfer failed.
-    TransferFailed = 30,
     /// Contract is already at the target version; no migration needed.
     AlreadyAtTargetVersion = 31,
-    /// Target version is lower than the current deployed version.
-    MigrationDowngradeNotAllowed = 32,
+    /// Duplicate multisig approval.
+    AlreadyApproved = 32,
     /// Admin rotation failed: new admin cannot be the same as current.
     AdminRotationSameAddress = 33,
     /// Admin rotation failed: another rotation is already pending.
     AdminRotationPending = 34,
+    /// Cross-contract token transfer failed.
+    TransferFailed = 35,
+    /// Target version is lower than the current deployed version.
+    MigrationDowngradeNotAllowed = 36,
+    /// Offering-scoped blacklist reached its configured maximum size.
+    BlacklistSizeLimitExceeded = 37,
+    /// Contract is paused for emergency response.
+    ContractPaused = 38,
+    /// No admin rotation is currently pending.
+    NoAdminRotationPending = 39,
+    /// Caller is not the pending admin for rotation acceptance.
+    UnauthorizedRotationAccept = 40,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -123,6 +143,9 @@ const EVENT_REV_INIT_V2: Symbol = symbol_short!("rv_init2");
 const EVENT_REV_INIA_V2: Symbol = symbol_short!("rv_inia2");
 const EVENT_REV_REP_V2: Symbol = symbol_short!("rv_rep2");
 const EVENT_REV_REPA_V2: Symbol = symbol_short!("rv_repa2");
+const EVENT_REV_INIA_V1: Symbol = EVENT_REVENUE_REPORT_INITIAL_ASSET;
+const EVENT_REV_REP_V1: Symbol = EVENT_REVENUE_REPORTED;
+const EVENT_REV_REPA_V1: Symbol = EVENT_REVENUE_REPORTED_ASSET;
 const EVENT_REV_DEPOSIT_V2: Symbol = symbol_short!("rev_dep2");
 const EVENT_REV_DEP_SNAP_V2: Symbol = symbol_short!("rev_snp2");
 const EVENT_CLAIM_V2: Symbol = symbol_short!("claim2");
@@ -130,6 +153,7 @@ const EVENT_SHARE_SET_V2: Symbol = symbol_short!("sh_set2");
 const EVENT_FREEZE_V2: Symbol = symbol_short!("frz2");
 const EVENT_CLAIM_DELAY_SET_V2: Symbol = symbol_short!("dly_set2");
 const EVENT_CONCENTRATION_WARNING_V2: Symbol = symbol_short!("conc2");
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("pt_dec");
 
 const EVENT_PROPOSAL_CREATED_V2: Symbol = symbol_short!("prop_n2");
 const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
@@ -140,7 +164,6 @@ const EVENT_DURATION_SET: Symbol = symbol_short!("dur_set");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(test, derive(proptest::prelude::Arbitrary))]
 pub enum ProposalAction {
     SetAdmin(Address),
     Freeze,
@@ -578,6 +601,12 @@ pub enum DataKey2 {
     StressDataCount(Address),
     /// Packed flags: (event_versioning_enabled: bool, event_only_mode: bool).
     ContractFlags,
+    /// Payment token decimals metadata for an offering.
+    PaymentTokenDecimals(OfferingId),
+    /// Offering-scoped freeze flag.
+    FrozenOffering(OfferingId),
+    /// Current deployed storage version for post-upgrade migrations.
+    DeployedVersion,
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -849,6 +878,12 @@ impl RevoraRevenueShare {
         env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
     }
 
+    fn is_event_versioning_enabled(env: Env) -> bool {
+        let (event_versioning_enabled, _event_only): (bool, bool) =
+            env.storage().persistent().get(&DataKey2::ContractFlags).unwrap_or((false, false));
+        event_versioning_enabled
+    }
+
     fn validate_window(window: &AccessWindow) -> Result<(), RevoraError> {
         if window.start_timestamp > window.end_timestamp {
             return Err(RevoraError::LimitReached);
@@ -895,6 +930,59 @@ impl RevoraRevenueShare {
             }
         }
         Ok(())
+    }
+
+    fn require_not_offering_frozen(env: &Env, offering_id: &OfferingId) -> Result<(), RevoraError> {
+        let key = DataKey2::FrozenOffering(offering_id.clone());
+        if env.storage().persistent().get::<DataKey2, bool>(&key).unwrap_or(false) {
+            return Err(RevoraError::ContractFrozen);
+        }
+        Ok(())
+    }
+
+    fn require_multisig_owner(env: &Env, caller: &Address) -> Result<(), RevoraError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigOwners)
+            .unwrap_or_else(|| Vec::new(env));
+        if !owners.contains(caller) {
+            return Err(RevoraError::LimitReached);
+        }
+        Ok(())
+    }
+
+    fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        Ok(())
+    }
+
+    fn get_effective_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+
+        if let Some(bps) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OfferingFeeBps(offering_id.clone(), asset.clone()))
+        {
+            return bps;
+        }
+
+        if let Some(bps) =
+            env.storage().persistent().get::<DataKey, u32>(&DataKey::PlatformFeePerAsset(asset))
+        {
+            return bps;
+        }
+
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
     }
 
     fn mark_meta_nonce_used(env: &Env, signer: &Address, nonce: u64) {
@@ -950,27 +1038,16 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-    /// Return the locked payment token for an offering.
+    /// Return the explicitly persisted payment token lock for an offering, if any.
     ///
-    /// Backward compatibility: older offerings may not have an explicit `PaymentToken` entry yet.
-    /// In that case, the offering's configured `payout_asset` is treated as the canonical lock.
+    /// The `PaymentToken` key is written only after the first successful deposit.
+    /// Before that point, the offering has no locked payment token.
     fn get_locked_payment_token_for_offering(
         env: &Env,
         offering_id: &OfferingId,
-    ) -> Result<Address, RevoraError> {
+    ) -> Option<Address> {
         let pt_key = DataKey::PaymentToken(offering_id.clone());
-        if let Some(payment_token) = env.storage().persistent().get::<DataKey, Address>(&pt_key) {
-            return Ok(payment_token);
-        }
-
-        let offering = Self::get_offering(
-            env.clone(),
-            offering_id.issuer.clone(),
-            offering_id.namespace.clone(),
-            offering_id.token.clone(),
-        )
-        .ok_or(RevoraError::OfferingNotFound)?;
-        Ok(offering.payout_asset)
+        env.storage().persistent().get::<DataKey, Address>(&pt_key)
     }
 
     /// Internal helper for revenue deposits.
@@ -1012,14 +1089,15 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        // Enforce period ordering invariant (double-check at deposit)
-        Self::require_next_period_id(env, &offering_id, period_id)?;
-
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(offering_id.clone(), period_id);
         if env.storage().persistent().has(&rev_key) {
             return Err(RevoraError::PeriodAlreadyDeposited);
         }
+
+        // Enforce period ordering invariant only after duplicate detection so repeated
+        // deposits fail with the period-specific error rather than a generic sequence error.
+        Self::validate_next_period_id(env, &offering_id, period_id)?;
 
         // Supply cap check (#96): reject if deposit would exceed cap
         let cap_key = DataKey::SupplyCap(offering_id.clone());
@@ -1033,16 +1111,13 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Enforce the offering's locked payment token. For legacy offerings without an
-        // explicit storage entry yet, `payout_asset` is the canonical lock and is persisted
-        // only after a successful deposit using that token.
-        let locked_payment_token = Self::get_locked_payment_token_for_offering(env, &offering_id)?;
-        if locked_payment_token != payment_token {
-            return Err(RevoraError::PaymentTokenMismatch);
-        }
         let pt_key = DataKey::PaymentToken(offering_id.clone());
-        if !env.storage().persistent().has(&pt_key) {
-            env.storage().persistent().set(&pt_key, &locked_payment_token);
+        if let Some(locked_payment_token) =
+            Self::get_locked_payment_token_for_offering(env, &offering_id)
+        {
+            if locked_payment_token != payment_token {
+                return Err(RevoraError::PaymentTokenMismatch);
+            }
         }
 
         // Transfer tokens from issuer to contract
@@ -1057,6 +1132,10 @@ impl RevoraRevenueShare {
         // Store period revenue
         env.storage().persistent().set(&rev_key, &amount);
 
+        if !env.storage().persistent().has(&pt_key) {
+            env.storage().persistent().set(&pt_key, &payment_token);
+        }
+
         // Store deposit timestamp for time-delayed claims (#27)
         let deposit_time = env.ledger().timestamp();
         let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
@@ -1068,6 +1147,7 @@ impl RevoraRevenueShare {
         let entry_key = DataKey::PeriodEntry(offering_id.clone(), count);
         env.storage().persistent().set(&entry_key, &period_id);
         env.storage().persistent().set(&count_key, &(count + 1));
+        Self::set_last_period_id(env, &offering_id, period_id);
 
         // Update cumulative deposited revenue and emit cap-reached event if applicable (#96)
         let deposited_key = DataKey::DepositedRevenue(offering_id.clone());
@@ -1101,7 +1181,7 @@ impl RevoraRevenueShare {
     /// Return true if the contract is in event-only mode.
     pub fn is_event_only(env: &Env) -> bool {
         let (_, event_only): (bool, bool) =
-            env.storage().persistent().get(&DataKey::ContractFlags).unwrap_or((false, false));
+            env.storage().persistent().get(&DataKey2::ContractFlags).unwrap_or((false, false));
         event_only
     }
 
@@ -1121,6 +1201,16 @@ impl RevoraRevenueShare {
         offering_id: &OfferingId,
         period_id: u64,
     ) -> Result<(), RevoraError> {
+        Self::validate_next_period_id(env, offering_id, period_id)?;
+        Self::set_last_period_id(env, offering_id, period_id);
+        Ok(())
+    }
+
+    fn validate_next_period_id(
+        env: &Env,
+        offering_id: &OfferingId,
+        period_id: u64,
+    ) -> Result<(), RevoraError> {
         if period_id == 0 {
             return Err(RevoraError::InvalidPeriodId);
         }
@@ -1129,8 +1219,12 @@ impl RevoraRevenueShare {
         if period_id <= last {
             return Err(RevoraError::InvalidPeriodId);
         }
-        env.storage().persistent().set(&key, &period_id);
         Ok(())
+    }
+
+    fn set_last_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) {
+        let key = DataKey::LastPeriodId(offering_id.clone());
+        env.storage().persistent().set(&key, &period_id);
     }
 
     /// Initialize the contract with an admin and an optional safety role.
@@ -1169,7 +1263,7 @@ impl RevoraRevenueShare {
         }
         env.storage().persistent().set(&DataKey::Paused, &false);
         let eo = event_only.unwrap_or(false);
-        env.storage().persistent().set(&DataKey::ContractFlags, &(false, eo));
+        env.storage().persistent().set(&DataKey2::ContractFlags, &(false, eo));
         env.events().publish((EVENT_INIT, admin.clone()), (safety, eo));
     }
 
@@ -1259,6 +1353,21 @@ impl RevoraRevenueShare {
         if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
             return Err(RevoraError::ContractPaused);
         }
+        Ok(())
+    }
+
+    /// Return true when testnet mode is enabled.
+    pub fn is_testnet_mode(env: Env) -> bool {
+        env.storage().persistent().get(&DataKey::TestnetMode).unwrap_or(false)
+    }
+
+    /// Toggle testnet mode. Requires an initialized admin.
+    pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::TestnetMode, &enabled);
+        env.events().publish((symbol_short!("test_md"), admin), enabled);
         Ok(())
     }
 
@@ -1433,8 +1542,7 @@ impl RevoraRevenueShare {
 
     /// Return the locked payment token for an offering.
     ///
-    /// For offerings created before explicit payment-token lock storage existed, this falls back
-    /// to the offering's configured `payout_asset`, which is treated as the canonical lock.
+    /// Returns `None` until the first successful deposit persists the `PaymentToken` key.
     pub fn get_payment_token(
         env: Env,
         issuer: Address,
@@ -1442,7 +1550,7 @@ impl RevoraRevenueShare {
         token: Address,
     ) -> Option<Address> {
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::get_locked_payment_token_for_offering(&env, &offering_id).ok()
+        Self::get_locked_payment_token_for_offering(&env, &offering_id)
     }
 
     /// Record a revenue report for an offering; updates audit summary and emits events.
@@ -1745,7 +1853,6 @@ impl RevoraRevenueShare {
                 (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (payout_asset.clone(), amount, period_id, blacklist.clone()),
             );
-        }
 
             env.events().publish(
                 (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
@@ -2152,12 +2259,7 @@ impl RevoraRevenueShare {
     /// before attempting an add.
     ///
     /// Returns 0 when no blacklist exists yet for the offering.
-    pub fn get_blacklist_size(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-    ) -> u32 {
+    pub fn get_blacklist_size(env: Env, issuer: Address, namespace: Symbol, token: Address) -> u32 {
         let offering_id = OfferingId { issuer, namespace, token };
         let key = DataKey::Blacklist(offering_id);
         env.storage()
@@ -2724,7 +2826,11 @@ impl RevoraRevenueShare {
 
         let share = base.checked_add(remainder_share).unwrap_or_else(|| {
             if (base >= 0 && remainder_share >= 0) || (base < 0 && remainder_share < 0) {
-                if base >= 0 { i128::MAX } else { i128::MIN }
+                if base >= 0 {
+                    i128::MAX
+                } else {
+                    i128::MIN
+                }
             } else {
                 0
             }
@@ -2789,12 +2895,13 @@ impl RevoraRevenueShare {
         if decimals > MAX_TOKEN_DECIMALS {
             return Err(RevoraError::LimitReached);
         }
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
-        env.storage()
-            .persistent()
-            .set(&DataKey::PaymentTokenDecimals(offering_id), &decimals);
-        env.events()
-            .publish((EVENT_DECIMAL_SET, issuer, namespace, token), decimals);
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage().persistent().set(&DataKey2::PaymentTokenDecimals(offering_id), &decimals);
+        env.events().publish((EVENT_DECIMAL_SET, issuer, namespace, token), decimals);
         Ok(())
     }
 
@@ -2809,7 +2916,7 @@ impl RevoraRevenueShare {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage()
             .persistent()
-            .get(&DataKey::PaymentTokenDecimals(offering_id))
+            .get(&DataKey2::PaymentTokenDecimals(offering_id))
             .unwrap_or(STELLAR_CANONICAL_DECIMALS)
     }
 
@@ -2832,7 +2939,7 @@ impl RevoraRevenueShare {
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::OfferingNotFound)` if the offering is not found.
     /// - `Err(RevoraError::PeriodAlreadyDeposited)` if revenue has already been deposited for this `period_id`.
-    /// - `Err(RevoraError::PaymentTokenMismatch)` if `payment_token` differs from previously locked token.
+    /// - `Err(RevoraError::PaymentTokenMismatch)` if `payment_token` differs from the token locked by the first successful deposit.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
     pub fn deposit_revenue(
         env: Env,
@@ -2844,6 +2951,7 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        issuer.require_auth();
 
         // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
         Self::require_valid_period_id(period_id)?;
@@ -3610,7 +3718,8 @@ impl RevoraRevenueShare {
 
         // Transfer only if there is a positive payout
         if total_payout > 0 {
-            let payment_token = Self::get_locked_payment_token_for_offering(&env, &offering_id)?;
+            let payment_token = Self::get_locked_payment_token_for_offering(&env, &offering_id)
+                .ok_or(RevoraError::PaymentTokenMismatch)?;
             let contract_addr = env.current_contract_address();
             if token::Client::new(&env, &payment_token)
                 .try_transfer(&contract_addr, &holder, &total_payout)
@@ -4253,7 +4362,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::NotAuthorized);
         }
 
-        let key = DataKey::FrozenOffering(offering_id);
+        let key = DataKey2::FrozenOffering(offering_id);
         env.storage().persistent().set(&key, &true);
         env.events().publish((EVENT_FREEZE_OFFERING, issuer, namespace, token), (caller, true));
         Ok(())
@@ -4287,7 +4396,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::NotAuthorized);
         }
 
-        let key = DataKey::FrozenOffering(offering_id);
+        let key = DataKey2::FrozenOffering(offering_id);
         env.storage().persistent().set(&key, &false);
         env.events().publish((EVENT_UNFREEZE_OFFERING, issuer, namespace, token), (caller, false));
         Ok(())
@@ -4303,7 +4412,7 @@ impl RevoraRevenueShare {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage()
             .persistent()
-            .get::<DataKey, bool>(&DataKey::FrozenOffering(offering_id))
+            .get::<DataKey2, bool>(&DataKey2::FrozenOffering(offering_id))
             .unwrap_or(false)
     }
 
@@ -4446,7 +4555,29 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-#![no_std]
+    /// Execute a multisig proposal once the configured approval threshold is met.
+    pub fn execute_action(env: Env, proposal_id: u32) -> Result<(), RevoraError> {
+        let key = DataKey::MultisigProposal(proposal_id);
+        let mut proposal: Proposal =
+            env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
+
+        if proposal.executed {
+            return Err(RevoraError::LimitReached);
+        }
+
+        if env.ledger().timestamp() >= proposal.expiry {
+            return Err(RevoraError::ProposalExpired);
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(RevoraError::NotInitialized)?;
+
+        if proposal.approvals.len() < threshold {
+            return Err(RevoraError::NotAuthorized);
+        }
 
         // Execute the action
         match proposal.action.clone() {
@@ -4505,479 +4636,14 @@ impl RevoraRevenueShare {
                 if new_duration == 0 {
                     return Err(RevoraError::InvalidAmount);
                 }
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::MultisigProposalDuration, &new_duration);
-                env.events().publish(
-                    (EVENT_DURATION_SET, proposal.proposer.clone()),
-                    new_duration,
-                );
+                env.storage().persistent().set(&DataKey::MultisigProposalDuration, &new_duration);
+                env.events().publish((EVENT_DURATION_SET, proposal.proposer.clone()), new_duration);
             }
         }
-
-// ─── Storage key types ────────────────────────────────────────────────────────
-
-/// Top-level storage keys stored in persistent contract storage.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// The contract admin address.
-    Admin,
-    /// The token contract ID used for all deposits and claims.
-    Token,
-    /// Counter tracking the next period ID to be assigned.
-    PeriodCounter,
-    /// All registered period IDs (Vec<u32>).
-    PeriodIds,
-    /// Per-period metadata, keyed by period ID.
-    Period(u32),
-    /// Per-period beneficiary list, keyed by period ID.
-    Beneficiaries(u32),
-    /// Claim record: whether `address` has claimed from `period_id`.
-    Claimed(u32, Address),
-}
-
-// ─── Domain types ─────────────────────────────────────────────────────────────
-
-/// Metadata for a single revenue period.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Period {
-    /// Unique monotonically-increasing identifier.
-    pub id: u32,
-    /// Ledger sequence number at which the period opens (inclusive).
-    pub start_ledger: u32,
-    /// Ledger sequence number at which the period closes (inclusive).
-    pub end_ledger: u32,
-    /// Total token amount deposited for distribution this period.
-    pub revenue_amount: i128,
-    /// How many tokens have been claimed so far.
-    pub claimed_amount: i128,
-}
-
-// ─── Error codes ──────────────────────────────────────────────────────────────
-
-/// Canonical error codes returned by contract functions.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ContractError {
-    /// Caller is not the admin.
-    Unauthorized = 1,
-    /// Contract has already been initialised.
-    AlreadyInitialized = 2,
-    /// The referenced period does not exist.
-    PeriodNotFound = 3,
-    /// The period's end ledger has not been reached yet.
-    PeriodNotEnded = 4,
-    /// The caller is not registered as a beneficiary for this period.
-    NotBeneficiary = 5,
-    /// The caller has already claimed their share for this period.
-    AlreadyClaimed = 6,
-    /// A period with overlapping ledger range already exists.
-    PeriodOverlap = 7,
-    /// The supplied parameters are logically invalid (e.g. start > end, zero amount).
-    InvalidInput = 8,
-    /// The revenue deposit failed (e.g. insufficient token balance).
-    DepositFailed = 9,
-    /// Arithmetic overflow occurred.
-    Overflow = 10,
-    /// No beneficiaries are registered; nothing to distribute.
-    NoBeneficiaries = 11,
-}
-
-// ─── Contract struct ──────────────────────────────────────────────────────────
-
-#[contract]
-pub struct RevenueDepositContract;
-
-// ─── Implementation ───────────────────────────────────────────────────────────
-
-#[contractimpl]
-impl RevenueDepositContract {
-    // ── Initialisation ────────────────────────────────────────────────────────
-
-    /// Initialise the contract.
-    ///
-    /// # Arguments
-    /// * `admin` – Address that will hold admin privileges.
-    /// * `token` – Stellar token contract address used for deposits/claims.
-    ///
-    /// # Errors
-    /// * [`ContractError::AlreadyInitialized`] – if called more than once.
-    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), ContractError> {
-        if env.storage().persistent().has(&DataKey::Admin) {
-            return Err(ContractError::AlreadyInitialized);
-        }
-        admin.require_auth();
-
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::Token, &token);
-        env.storage().persistent().set(&DataKey::PeriodCounter, &0u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::PeriodIds, &Vec::<u32>::new(&env));
-
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.events().publish((EVENT_PROPOSAL_EXECUTED, proposal.proposer.clone()), proposal_id);
         Ok(())
-    }
-
-    // ── Period management ─────────────────────────────────────────────────────
-
-    /// Create a new revenue period and transfer `revenue_amount` tokens from the
-    /// admin into the contract.
-    ///
-    /// # Arguments
-    /// * `start_ledger` – First ledger of the period (inclusive, must be ≥ current ledger).
-    /// * `end_ledger`   – Last ledger of the period (inclusive, must be > `start_ledger`).
-    /// * `revenue_amount` – Positive token quantity to deposit for this period.
-    ///
-    /// # Errors
-    /// * [`ContractError::Unauthorized`]   – caller is not admin.
-    /// * [`ContractError::InvalidInput`]   – bad ledger range or zero/negative amount.
-    /// * [`ContractError::PeriodOverlap`]  – range overlaps an existing period.
-    pub fn create_period(
-        env: Env,
-        start_ledger: u32,
-        end_ledger: u32,
-        revenue_amount: i128,
-    ) -> Result<u32, ContractError> {
-        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        // ── Validate inputs ────────────────────────────────────────────────
-        if revenue_amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
-        if start_ledger >= end_ledger {
-            return Err(ContractError::InvalidInput);
-        }
-
-        // ── Overlap detection ──────────────────────────────────────────────
-        Self::assert_no_overlap(&env, start_ledger, end_ledger)?;
-
-        // ── Assign ID ─────────────────────────────────────────────────────
-        let mut counter: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodCounter)
-            .unwrap_or(0);
-        let period_id = counter;
-        counter = counter.checked_add(1).ok_or(ContractError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PeriodCounter, &counter);
-
-        // ── Persist period ─────────────────────────────────────────────────
-        let period = Period {
-            id: period_id,
-            start_ledger,
-            end_ledger,
-            revenue_amount,
-            claimed_amount: 0,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Period(period_id), &period);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Beneficiaries(period_id), &Vec::<Address>::new(&env));
-
-        let mut ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodIds)
-            .unwrap_or_else(|| Vec::new(&env));
-        ids.push_back(period_id);
-        env.storage().persistent().set(&DataKey::PeriodIds, &ids);
-
-        // ── Pull tokens from admin ─────────────────────────────────────────
-        let token: Address = env.storage().persistent().get(&DataKey::Token).unwrap();
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&admin, &env.current_contract_address(), &revenue_amount);
-
-        Ok(period_id)
-    }
-
-    // ── Beneficiary management ────────────────────────────────────────────────
-
-    /// Register `beneficiary` as eligible to claim from `period_id`.
-    ///
-    /// Idempotent — adding a beneficiary twice is a no-op (not an error).
-    ///
-    /// # Errors
-    /// * [`ContractError::Unauthorized`]  – caller is not admin.
-    /// * [`ContractError::PeriodNotFound`] – `period_id` does not exist.
-    pub fn add_beneficiary(
-        env: Env,
-        period_id: u32,
-        beneficiary: Address,
-    ) -> Result<(), ContractError> {
-        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        Self::assert_period_exists(&env, period_id)?;
-
-        let mut beneficiaries: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Beneficiaries(period_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Idempotency guard
-        if !beneficiaries.contains(&beneficiary) {
-            beneficiaries.push_back(beneficiary);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Beneficiaries(period_id), &beneficiaries);
-        }
-
-        Ok(())
-    }
-
-    /// Remove `beneficiary` from `period_id`.  If they have not yet claimed their
-    /// share, that share reverts to the unclaimed pool (claimable by remaining
-    /// beneficiaries or recoverable by admin via a future extension).
-    ///
-    /// # Errors
-    /// * [`ContractError::Unauthorized`]   – caller is not admin.
-    /// * [`ContractError::PeriodNotFound`] – `period_id` does not exist.
-    /// * [`ContractError::NotBeneficiary`] – address not currently registered.
-    pub fn remove_beneficiary(
-        env: Env,
-        period_id: u32,
-        beneficiary: Address,
-    ) -> Result<(), ContractError> {
-        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        Self::assert_period_exists(&env, period_id)?;
-
-        let mut beneficiaries: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Beneficiaries(period_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let pos = beneficiaries
-            .iter()
-            .position(|b| b == beneficiary)
-            .ok_or(ContractError::NotBeneficiary)?;
-
-        beneficiaries.remove(pos as u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Beneficiaries(period_id), &beneficiaries);
-
-        Ok(())
-    }
-
-    // ── Claims ────────────────────────────────────────────────────────────────
-
-    /// Claim a pro-rata share of `period_id`'s revenue.
-    ///
-    /// The share is `floor(revenue_amount / beneficiary_count)`.  Any remainder
-    /// (due to integer division) stays in the contract as unclaimed dust.
-    ///
-    /// # Preconditions
-    /// * Current ledger must be **strictly after** `end_ledger` of the period.
-    /// * Caller must be a registered beneficiary.
-    /// * Caller must not have claimed before.
-    ///
-    /// Rounding: Uses integer division which rounds down (floor).
-    /// This is conservative and ensures the contract never over-distributes.
-    // This entrypoint shape is part of the public contract interface and mirrors
-    // off-chain inputs directly, so we allow this specific arity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn calculate_distribution(
-        env: Env,
-        caller: Address,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        total_revenue: i128,
-        total_supply: i128,
-        holder_balance: i128,
-        holder: Address,
-    ) -> i128 {
-        caller.require_auth();
-
-        if total_supply == 0 {
-            return 0i128;
-        }
-
-        let offering =
-            match Self::get_offering(env.clone(), issuer.clone(), namespace, token.clone()) {
-                Some(o) => o,
-                None => return 0i128,
-            };
-
-        if Self::is_blacklisted(
-            env.clone(),
-            issuer.clone(),
-            offering.namespace.clone(),
-            token.clone(),
-            holder.clone(),
-        ) {
-            return 0i128;
-        }
-
-        // ── Timing gate ────────────────────────────────────────────────────
-        let current_ledger = env.ledger().sequence();
-        if current_ledger <= period.end_ledger {
-            return Err(ContractError::PeriodNotEnded);
-        }
-
-        // ── Beneficiary check ──────────────────────────────────────────────
-        let beneficiaries: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Beneficiaries(period_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        if beneficiaries.is_empty() {
-            return Err(ContractError::NoBeneficiaries);
-        }
-
-        if !beneficiaries.contains(&claimant) {
-            return Err(ContractError::NotBeneficiary);
-        }
-
-        // ── Double-claim guard ─────────────────────────────────────────────
-        let claim_key = DataKey::Claimed(period_id, claimant.clone());
-        if env.storage().persistent().has(&claim_key) {
-            return Err(ContractError::AlreadyClaimed);
-        }
-
-        // ── Compute share ──────────────────────────────────────────────────
-        let count = beneficiaries.len() as i128;
-        let share = period
-            .revenue_amount
-            .checked_div(count)
-            .ok_or(ContractError::Overflow)?;
-
-        if share <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
-
-        // ── Update state (checks-effects-interactions) ─────────────────────
-        env.storage().persistent().set(&claim_key, &true);
-        period.claimed_amount = period
-            .claimed_amount
-            .checked_add(share)
-            .ok_or(ContractError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Period(period_id), &period);
-
-        // ── Transfer tokens ────────────────────────────────────────────────
-        let token: Address = env.storage().persistent().get(&DataKey::Token).unwrap();
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &claimant, &share);
-
-        Ok(share)
-    }
-
-    // ── Read-only helpers ─────────────────────────────────────────────────────
-
-    /// Return metadata for a period.
-    pub fn get_period(env: Env, period_id: u32) -> Result<Period, ContractError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Period(period_id))
-            .ok_or(ContractError::PeriodNotFound)
-    }
-
-    /// Return all period IDs registered with this contract.
-    pub fn get_period_ids(env: Env) -> Vec<u32> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PeriodIds)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Return the beneficiary list for a period.
-    pub fn get_beneficiaries(env: Env, period_id: u32) -> Result<Vec<Address>, ContractError> {
-        Self::assert_period_exists(&env, period_id)?;
-        Ok(env
-            .storage()
-            .persistent()
-            .get(&DataKey::Beneficiaries(period_id))
-            .unwrap_or_else(|| Vec::new(&env)))
-    }
-
-    /// Return whether `address` has claimed from `period_id`.
-    pub fn has_claimed(env: Env, period_id: u32, address: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Claimed(period_id, address))
-    }
-
-    /// Return the current admin address.
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().persistent().get(&DataKey::Admin).unwrap()
-    }
-
-    /// Return the token contract address.
-    pub fn get_token(env: Env) -> Address {
-        env.storage().persistent().get(&DataKey::Token).unwrap()
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    /// Assert that `period_id` is stored.
-    fn assert_period_exists(env: &Env, period_id: u32) -> Result<(), ContractError> {
-        if !env.storage().persistent().has(&DataKey::Period(period_id)) {
-            return Err(ContractError::PeriodNotFound);
-        }
-        Ok(())
-    }
-
-    /// Assert that [start_ledger, end_ledger] does not overlap any existing period.
-    fn assert_no_overlap(
-        env: &Env,
-        start_ledger: u32,
-        end_ledger: u32,
-    ) -> Result<(), ContractError> {
-        let ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodIds)
-            .unwrap_or_else(|| Vec::new(env));
-
-        for id in ids.iter() {
-            let existing: Period = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Period(id))
-                .unwrap();
-            // Overlap: NOT (new_end < existing_start OR new_start > existing_end)
-            if !(end_ledger < existing.start_ledger || start_ledger > existing.end_ledger) {
-                return Err(ContractError::PeriodOverlap);
-            }
-        }
-        Ok(())
-    }
-
-    /// Build a summary map of unclaimed amounts per period (useful for admin dashboards).
-    pub fn unclaimed_summary(env: Env) -> Map<u32, i128> {
-        let ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodIds)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut map: Map<u32, i128> = Map::new(&env);
-        for id in ids.iter() {
-            if let Some(period) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Period>(&DataKey::Period(id))
-            {
-                let unclaimed = period.revenue_amount - period.claimed_amount;
-                map.set(id, unclaimed);
-            }
-        }
-        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
     }
 
     /// Calculate fee for (offering, asset, amount) using effective fee bps.
@@ -5003,23 +4669,17 @@ impl RevenueDepositContract {
     /// - Only the current admin can call this.
     /// - Respects the contract freeze state.
     /// - Prevents downgrades or re-running the same migration.
-    /// - Updates `DataKey::DeployedVersion` only on success.
+    /// - Updates `DataKey2::DeployedVersion` only on success.
     pub fn migrate(env: Env) -> Result<u32, RevoraError> {
         Self::require_not_frozen(&env)?;
 
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(RevoraError::NotInitialized)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
 
         admin.require_auth();
 
-        let stored_version = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DeployedVersion)
-            .unwrap_or(0u32);
+        let stored_version =
+            env.storage().persistent().get(&DataKey2::DeployedVersion).unwrap_or(0u32);
 
         if stored_version == CONTRACT_VERSION {
             return Err(RevoraError::AlreadyAtTargetVersion);
@@ -5034,12 +4694,10 @@ impl RevenueDepositContract {
             Self::run_migration_hook(&env, version)?;
         }
 
-        env.storage().persistent().set(&DataKey::DeployedVersion, &CONTRACT_VERSION);
+        env.storage().persistent().set(&DataKey2::DeployedVersion, &CONTRACT_VERSION);
 
-        env.events().publish(
-            (symbol_short!("migrated"), admin),
-            (stored_version, CONTRACT_VERSION),
-        );
+        env.events()
+            .publish((symbol_short!("migrated"), admin), (stored_version, CONTRACT_VERSION));
 
         Ok(CONTRACT_VERSION)
     }
@@ -5068,10 +4726,7 @@ impl RevenueDepositContract {
 
     /// Return the current deployed version of the contract state.
     pub fn get_deployed_version(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DeployedVersion)
-            .unwrap_or(0)
+        env.storage().persistent().get(&DataKey2::DeployedVersion).unwrap_or(0)
     }
 
     /// Return the current contract version (#23). Used for upgrade compatibility and migration.

@@ -8,7 +8,7 @@
 | Function          | Check Performed |
 |-------------------|-----------------|
 | `report_revenue` | `period_id > LastPeriodId(offering)` → `Err(InvalidPeriodId)`; then set `LastPeriodId` |
-| `deposit_revenue` | Same double-check + `period_id > 0`; then set `LastPeriodId` |
+| `deposit_revenue` | `period_id > LastPeriodId(offering)` and period not already deposited; set `LastPeriodId` only after a successful deposit |
 
 ## Storage Impact
 - `DataKey::LastPeriodId(OfferingId)`: `u64` (~8 bytes + overhead per active offering).
@@ -18,6 +18,7 @@
 
 ## Abuse Mitigations
 - Rejects invalid sequencing (e.g., deposit period 1 → 0, duplicate 5, skip to 7).
+- Failed deposits do not consume the next valid `period_id`.
 - Ensures chronological processing order via sequential `PeriodEntry` indexing.
 - Compatible with existing claims/views (index-based, unaffected).
 
@@ -33,4 +34,3 @@
 ## Upgrade Safety
 - New storage key; existing data unaffected.
 - CONTRACT_VERSION bump recommended for migration checks.
-
