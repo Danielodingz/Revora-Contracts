@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 #![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
+#![allow(dead_code, unused_variables, unused_mut, clippy::unnecessary_lazy_evaluations)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
     BytesN, Env, IntoVal, Map, Symbol, Vec,
