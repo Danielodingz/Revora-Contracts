@@ -2,66 +2,60 @@
 
 ## Summary
 
-Each offering's payout asset is locked at registration time via the `payout_asset` parameter of
-`register_offering`. Once locked, every `deposit_revenue` and `deposit_revenue_with_snapshot` call
-must use that same token. Attempts to deposit with a different token are rejected with
-`RevoraError::PaymentTokenMismatch`.
+`PaymentToken` is now locked only by the first **successful** `deposit_revenue`
+or `deposit_revenue_with_snapshot` call for an offering.
+
+This hardening restores the storage model documented in the contract:
+
+- `PaymentToken(OfferingId)` records the canonical payout token only after success
+- `PeriodRevenue(OfferingId, period_id)` records one successful deposit per period
+- `PeriodEntry(OfferingId, index)` enumerates only successfully deposited periods
+
+There is no fallback from `PaymentToken` to `Offering.payout_asset` during
+deposit processing or `get_payment_token` reads.
 
 ## Behavior
 
-- The canonical payout token is set when `register_offering` is called.
-- `get_payment_token(issuer, namespace, token)` returns `Some(address)` immediately after
-  registration, before any deposit has occurred.
-- On the first successful deposit the lock entry is persisted to storage (backfill).
-- All subsequent deposits must use the locked token; mismatches are rejected atomically — no
-  period state is written on failure.
-- Claims resolve the payment token via the same canonical lock path.
+- `get_payment_token` returns `None` before the first successful deposit.
+- The first successful deposit writes `PaymentToken = payment_token`.
+- Subsequent deposits must use that exact token or fail with
+  `RevoraError::PaymentTokenMismatch`.
+- Duplicate period deposits fail with `RevoraError::PeriodAlreadyDeposited`.
+- Failed deposits do not write `PaymentToken`, `PeriodRevenue`, `PeriodEntry`,
+  `PeriodCount`, or `LastPeriodId`.
 
 ## Security Assumptions
 
-1. **Single canonical payout asset per offering.** Revenue deposits and claims use one token only.
-   This prevents asset-mixing across periods for the same offering.
+1. Payment-token locking is success-based:
+- A token is canonical only after a transfer-backed deposit succeeds.
+- Validation failures or transfer failures must not partially initialize lock state.
 
-2. **Offering configuration is the trust boundary.** The issuer chooses `payout_asset` during
-   `register_offering`. After registration the contract treats that asset as immutable
-   payment-token policy.
+2. Asset identity is explicit:
+- The contract never silently coerces `payment_token` from `payout_asset`.
+- Integrators must pass the intended payout token on the first successful deposit.
 
-3. **Fail closed on mismatch.** A deposit using any other token returns
-   `RevoraError::PaymentTokenMismatch`. No period state is written when this happens.
+3. Retry safety is required:
+- A failed first deposit for `period_id = N` must leave `N` reusable for a correct retry.
+- This prevents accidental `InvalidPeriodId` or `PaymentTokenMismatch` outcomes on
+  correct follow-up sequencing.
 
-4. **Lock is per-offering.** Two offerings registered by the same issuer may use different payout
-   assets; each lock is independent.
-
-## Interface
-
-### `get_payment_token(issuer, namespace, token) -> Option<Address>`
-
-Returns:
-- `Some(address)` — the locked payout token for a known offering.
-- `None` — the offering does not exist.
-
-### `deposit_revenue(issuer, namespace, token, payment_token, amount, period_id)`
-
-Fails with `PaymentTokenMismatch` if `payment_token` differs from the locked token.
+4. Duplicate periods fail closed:
+- Once `PeriodRevenue(offering, period_id)` exists, the same `period_id` is always
+  rejected as already deposited.
 
 ## Test Coverage
 
-| Test | What it verifies |
-|------|-----------------|
-| `register_offering_locks_payment_token_before_first_deposit` | Lock visible immediately after registration |
-| `get_payment_token_returns_none_for_unknown_offering` | Unknown offering returns `None` |
-| `deposit_revenue_preserves_locked_payment_token_across_deposits` | Lock stable across multiple deposits |
-| `report_revenue_rejects_mismatched_payout_asset` | Mismatch rejected at report time |
-| `first_deposit_uses_registered_payment_token_lock` | First deposit uses configured asset |
-| `snapshot_deposit_preserves_registered_payment_token_lock` | Snapshot deposit respects lock |
-| `deposit_revenue_rejects_mismatched_token_after_lock` | Different token rejected after lock-in |
-| `deposit_revenue_rejects_wrong_token_on_first_deposit` | Wrong token rejected on first deposit |
-| `payment_token_lock_is_stable_across_multiple_deposits` | Lock address unchanged after N deposits |
-| `payment_token_lock_is_per_offering` | Two offerings lock independently |
+Covered in `src/test.rs`:
 
-## Review Scope
+- `register_offering_does_not_lock_payment_token_before_first_deposit`
+- `failed_first_deposit_does_not_lock_payment_token_or_consume_period`
+- `first_deposit_uses_registered_payment_token_lock`
+- `second_deposit_rejects_wrong_payment_token_without_mutating_state`
+- `deposit_revenue_fails_for_duplicate_period`
+- zero-amount and invalid-period rejection without lock mutation
 
-Changes are limited to:
-- `src/lib.rs`
-- `src/test.rs`
-- this document
+## Review Notes
+
+- `PaymentTokenMismatch` is now reserved for a real post-lock mismatch.
+- Correct integrator sequencing cannot trigger that error accidentally before any
+  successful deposit has established the lock.

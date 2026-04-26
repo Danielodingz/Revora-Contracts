@@ -49,20 +49,11 @@ Returns the configured decimal precision, or `7` if not set.
 
 ## Security Assumptions
 
-1. **Issuer responsibility.** The issuer is trusted to supply the correct on-chain token decimal
-   value. An incorrect value directly affects all future claim payouts. Issuers should verify the
-   decimal on-chain before calling this function.
-
-2. **Set before first deposit.** Changing decimals after revenue has been deposited will cause
-   future claims to normalize differently from past deposits. Issuers should set decimals before
-   the first `deposit_revenue` call.
-
-3. **Overflow is safe.** All multiplications are guarded with `checked_mul`. Overflow returns `0`,
-   preventing fund inflation but potentially causing zero payouts for extremely large amounts with
-   low-decimal tokens.
-
-4. **Scope is per-offering.** Decimals are per-offering, not per-asset globally. Two offerings
-   with the same payout asset may have different decimal configurations.
+1. **Issuer responsibility**: The `issuer` is trusted to supply the correct on-chain token decimal value. An incorrect value directly affects all future claim payouts. Issuers should verify the decimal on-chain before calling this function.
+2. **Immutable after set**: There is no restriction on updating decimals after the fact, but changing decimals mid-offering will affect future claims inconsistently with past revenue reports. Issuers should set decimals before the first revenue report.
+3. **Overflow is safe**: All multiplications are guarded with `checked_mul`. Overflow returns `0`, preventing fund inflation but potentially causing zero payouts for extremely large amounts with low-decimal tokens.
+4. **Scope**: Decimals are per-offering, not per-asset globally. Two offerings with the same payout asset may have different decimal configurations.
+5. **Read-Side Pagination**: When computing holder shares iteratively off-chain, be aware that paginated endpoints (e.g., `get_offerings_page`, `get_blacklist_page`) are capped at a `MAX_PAGE_LIMIT` of 20 to prevent unbounded execution. Indexers fetching multiple properties must handle this cursor-based traversal safely.
 
 ## Example
 
