@@ -162,6 +162,9 @@ const EVENT_REV_INIT_V2: Symbol = symbol_short!("rv_init2");
 const EVENT_REV_INIA_V2: Symbol = symbol_short!("rv_inia2");
 const EVENT_REV_REP_V2: Symbol = symbol_short!("rv_rep2");
 const EVENT_REV_REPA_V2: Symbol = symbol_short!("rv_repa2");
+const EVENT_REV_INIA_V1: Symbol = EVENT_REVENUE_REPORT_INITIAL_ASSET;
+const EVENT_REV_REP_V1: Symbol = EVENT_REVENUE_REPORTED;
+const EVENT_REV_REPA_V1: Symbol = EVENT_REVENUE_REPORTED_ASSET;
 const EVENT_REV_DEPOSIT_V2: Symbol = symbol_short!("rev_dep2");
 const EVENT_REV_DEP_SNAP_V2: Symbol = symbol_short!("rev_snp2");
 const EVENT_CLAIM_V2: Symbol = symbol_short!("claim2");
@@ -169,6 +172,7 @@ const EVENT_SHARE_SET_V2: Symbol = symbol_short!("sh_set2");
 const EVENT_FREEZE_V2: Symbol = symbol_short!("frz2");
 const EVENT_CLAIM_DELAY_SET_V2: Symbol = symbol_short!("dly_set2");
 const EVENT_CONCENTRATION_WARNING_V2: Symbol = symbol_short!("conc2");
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("pt_dec");
 
 const EVENT_PROPOSAL_CREATED_V2: Symbol = symbol_short!("prop_n2");
 const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
@@ -1047,6 +1051,59 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    fn require_not_offering_frozen(env: &Env, offering_id: &OfferingId) -> Result<(), RevoraError> {
+        let key = DataKey2::FrozenOffering(offering_id.clone());
+        if env.storage().persistent().get::<DataKey2, bool>(&key).unwrap_or(false) {
+            return Err(RevoraError::ContractFrozen);
+        }
+        Ok(())
+    }
+
+    fn require_multisig_owner(env: &Env, caller: &Address) -> Result<(), RevoraError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigOwners)
+            .unwrap_or_else(|| Vec::new(env));
+        if !owners.contains(caller) {
+            return Err(RevoraError::LimitReached);
+        }
+        Ok(())
+    }
+
+    fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        Ok(())
+    }
+
+    fn get_effective_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+
+        if let Some(bps) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OfferingFeeBps(offering_id.clone(), asset.clone()))
+        {
+            return bps;
+        }
+
+        if let Some(bps) =
+            env.storage().persistent().get::<DataKey, u32>(&DataKey::PlatformFeePerAsset(asset))
+        {
+            return bps;
+        }
+
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
     fn mark_meta_nonce_used(env: &Env, signer: &Address, nonce: u64) {
         let nonce_key = MetaDataKey::NonceUsed(signer.clone(), nonce);
         env.storage().persistent().set(&nonce_key, &true);
@@ -1100,27 +1157,16 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-    /// Return the locked payment token for an offering.
+    /// Return the explicitly persisted payment token lock for an offering, if any.
     ///
-    /// Backward compatibility: older offerings may not have an explicit `PaymentToken` entry yet.
-    /// In that case, the offering's configured `payout_asset` is treated as the canonical lock.
+    /// The `PaymentToken` key is written only after the first successful deposit.
+    /// Before that point, the offering has no locked payment token.
     fn get_locked_payment_token_for_offering(
         env: &Env,
         offering_id: &OfferingId,
-    ) -> Result<Address, RevoraError> {
+    ) -> Option<Address> {
         let pt_key = DataKey::PaymentToken(offering_id.clone());
-        if let Some(payment_token) = env.storage().persistent().get::<DataKey, Address>(&pt_key) {
-            return Ok(payment_token);
-        }
-
-        let offering = Self::get_offering(
-            env.clone(),
-            offering_id.issuer.clone(),
-            offering_id.namespace.clone(),
-            offering_id.token.clone(),
-        )
-        .ok_or(RevoraError::OfferingNotFound)?;
-        Ok(offering.payout_asset)
+        env.storage().persistent().get::<DataKey, Address>(&pt_key)
     }
 
     /// Internal helper for revenue deposits.
@@ -1173,6 +1219,10 @@ impl RevoraRevenueShare {
             return Err(RevoraError::PeriodAlreadyDeposited);
         }
 
+        // Enforce period ordering invariant only after duplicate detection so repeated
+        // deposits fail with the period-specific error rather than a generic sequence error.
+        Self::validate_next_period_id(env, &offering_id, period_id)?;
+
         // Supply cap check (#96): reject if deposit would exceed cap
         let cap_key = DataKey::SupplyCap(offering_id.clone());
         let cap: i128 = env.storage().persistent().get(&cap_key).unwrap_or(0);
@@ -1185,16 +1235,13 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Enforce the offering's locked payment token. For legacy offerings without an
-        // explicit storage entry yet, `payout_asset` is the canonical lock and is persisted
-        // only after a successful deposit using that token.
-        let locked_payment_token = Self::get_locked_payment_token_for_offering(env, &offering_id)?;
-        if locked_payment_token != payment_token {
-            return Err(RevoraError::PaymentTokenMismatch);
-        }
         let pt_key = DataKey::PaymentToken(offering_id.clone());
-        if !env.storage().persistent().has(&pt_key) {
-            env.storage().persistent().set(&pt_key, &locked_payment_token);
+        if let Some(locked_payment_token) =
+            Self::get_locked_payment_token_for_offering(env, &offering_id)
+        {
+            if locked_payment_token != payment_token {
+                return Err(RevoraError::PaymentTokenMismatch);
+            }
         }
 
         // Transfer tokens from issuer to contract
@@ -1208,6 +1255,10 @@ impl RevoraRevenueShare {
 
         // Store period revenue
         env.storage().persistent().set(&rev_key, &amount);
+
+        if !env.storage().persistent().has(&pt_key) {
+            env.storage().persistent().set(&pt_key, &payment_token);
+        }
 
         // Store deposit timestamp for time-delayed claims (#27)
         let deposit_time = env.ledger().timestamp();
@@ -1531,6 +1582,21 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Return true when testnet mode is enabled.
+    pub fn is_testnet_mode(env: Env) -> bool {
+        env.storage().persistent().get(&DataKey::TestnetMode).unwrap_or(false)
+    }
+
+    /// Toggle testnet mode. Requires an initialized admin.
+    pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::TestnetMode, &enabled);
+        env.events().publish((symbol_short!("test_md"), admin), enabled);
+        Ok(())
+    }
+
     // ── Offering management ───────────────────────────────────
 
     /// Register a new revenue-share offering.
@@ -1709,8 +1775,7 @@ impl RevoraRevenueShare {
 
     /// Return the locked payment token for an offering.
     ///
-    /// For offerings created before explicit payment-token lock storage existed, this falls back
-    /// to the offering's configured `payout_asset`, which is treated as the canonical lock.
+    /// Returns `None` until the first successful deposit persists the `PaymentToken` key.
     pub fn get_payment_token(
         env: Env,
         issuer: Address,
@@ -1718,7 +1783,7 @@ impl RevoraRevenueShare {
         token: Address,
     ) -> Option<Address> {
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::get_locked_payment_token_for_offering(&env, &offering_id).ok()
+        Self::get_locked_payment_token_for_offering(&env, &offering_id)
     }
 
     /// Record or correct a revenue report for an offering and emit audit events.
@@ -3236,7 +3301,7 @@ impl RevoraRevenueShare {
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::OfferingNotFound)` if the offering is not found.
     /// - `Err(RevoraError::PeriodAlreadyDeposited)` if revenue has already been deposited for this `period_id`.
-    /// - `Err(RevoraError::PaymentTokenMismatch)` if `payment_token` differs from previously locked token.
+    /// - `Err(RevoraError::PaymentTokenMismatch)` if `payment_token` differs from the token locked by the first successful deposit.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
     pub fn deposit_revenue(
         env: Env,
@@ -3248,6 +3313,7 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        issuer.require_auth();
 
         // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
         Self::require_valid_period_id(period_id)?;
@@ -4083,7 +4149,8 @@ impl RevoraRevenueShare {
 
         // Transfer only if there is a positive payout
         if total_payout > 0 {
-            let payment_token = Self::get_locked_payment_token_for_offering(&env, &offering_id)?;
+            let payment_token = Self::get_locked_payment_token_for_offering(&env, &offering_id)
+                .ok_or(RevoraError::PaymentTokenMismatch)?;
             let contract_addr = env.current_contract_address();
             if token::Client::new(&env, &payment_token)
                 .try_transfer(&contract_addr, &holder, &total_payout)

@@ -14,6 +14,7 @@ Soroban contract for revenue-share offerings and blacklist management.
 |--------|------------|---------|------|-------------|
 | `register_offering` | `issuer: Address`, `token: Address`, `revenue_share_bps: u32` | `Result<(), RevoraError>` | issuer | Register a revenue-share offering. Fails with `InvalidRevenueShareBps` if `revenue_share_bps > 10000`. |
 | `get_offering` | `issuer: Address`, `token: Address` | `Option<Offering>` | — | Fetch one offering by issuer and token. |
+| `get_payment_token` | `issuer: Address`, `namespace: Symbol`, `token: Address` | `Option<Address>` | — | Return the payment token locked by the first successful deposit. Returns `None` before the first successful deposit or for an unknown offering. |
 | `list_offerings` | `issuer: Address` | `Vec<Address>` | — | List offering tokens for issuer (first page only, up to 20). |
 | `report_revenue` | `issuer: Address`, `token: Address`, `amount: i128`, `period_id: u64` | `Result<(), RevoraError>` | issuer | Emit or correct a revenue report. New periods update `AuditSummary`; existing periods may be corrected with `override_existing=true`, which emits explicit override events and applies the net delta to `total_revenue` without incrementing `report_count`. |
 | `get_offering_count` | `issuer: Address` | `u32` | — | Total offerings registered by issuer. |
@@ -412,7 +413,7 @@ Offering Token (Address)
    ├─ Validate:
    │    ├─ Offering exists (get_offering)
    │    ├─ Period not already deposited (PeriodRevenue not set)
-   │    └─ Payment token matches previous deposits (if any)
+   │    └─ Payment token matches the stored lock (if a previous successful deposit exists)
    ├─ Token transfer: payment_token.transfer(issuer → contract, amount)
    └─ State changes:
         ├─ Write: PeriodRevenue(token, period_id) = amount
@@ -420,7 +421,7 @@ Offering Token (Address)
         ├─ Read: PeriodCount(token) → count
         ├─ Write: PeriodEntry(token, count) = period_id
         ├─ Write: PeriodCount(token) = count + 1
-        ├─ Write (once): PaymentToken(token) = payment_token (if first deposit)
+        ├─ Write (once): PaymentToken(token) = payment_token (after the first successful deposit)
         └─ Event: rev_dep(issuer, token, (payment_token, amount, period_id))
 
 2. Result: Holders can now claim this period via claim()
@@ -433,11 +434,12 @@ Offering Token (Address)
 **Error conditions:**
 - `OfferingNotFound`: No offering exists for (issuer, token)
 - `PeriodAlreadyDeposited`: Period already has revenue deposited
-- `PaymentTokenMismatch`: Different payment token than previous deposits
+- `PaymentTokenMismatch`: Different payment token than the token locked by the first successful deposit
 - `ContractFrozen`: Contract is frozen
 
 **Integration notes:**
-- **Payment token is locked** on first deposit; all subsequent deposits must use the same token
+- **Payment token is locked only after a successful first deposit**; failed deposits do not set `PaymentToken`
+- **Duplicate period IDs fail as `PeriodAlreadyDeposited`** before any sequencing state is updated
 - **Period IDs are arbitrary** (u64); issuers can use timestamps, sequential numbers, or any scheme
 - **Period order matters**: Claims are processed in deposit order (via PeriodEntry index), not period_id order
 
@@ -1484,7 +1486,7 @@ Offering Token (Address)
         ├─ Read: PeriodCount(token) → count
         ├─ Write: PeriodEntry(token, count) = period_id
         ├─ Write: PeriodCount(token) = count + 1
-        ├─ Write (once): PaymentToken(token) = payment_token (if first deposit)
+        ├─ Write (once): PaymentToken(token) = payment_token (after the first successful deposit)
         └─ Event: rev_dep(issuer, token, (payment_token, amount, period_id))
 
 2. Result: Holders can now claim this period via claim()
@@ -1497,11 +1499,12 @@ Offering Token (Address)
 **Error conditions:**
 - `OfferingNotFound`: No offering exists for (issuer, token)
 - `PeriodAlreadyDeposited`: Period already has revenue deposited
-- `PaymentTokenMismatch`: Different payment token than previous deposits
+- `PaymentTokenMismatch`: Different payment token than the token locked by the first successful deposit
 - `ContractFrozen`: Contract is frozen
 
 **Integration notes:**
-- **Payment token is locked** on first deposit; all subsequent deposits must use the same token
+- **Payment token is locked only after a successful first deposit**; failed deposits do not set `PaymentToken`
+- **Duplicate period IDs fail as `PeriodAlreadyDeposited`** before any sequencing state is updated
 - **Period IDs are arbitrary** (u64); issuers can use timestamps, sequential numbers, or any scheme
 - **Period order matters**: Claims are processed in deposit order (via PeriodEntry index), not period_id order
 

@@ -22,6 +22,7 @@
 
 ## Abuse Mitigations
 - Rejects invalid sequencing (e.g., deposit period 1 → 0, duplicate 5, skip to 7).
+- Failed deposits do not consume the next valid `period_id`.
 - Ensures chronological processing order via sequential `PeriodEntry` indexing.
 - Compatible with existing claims/views (index-based, unaffected).
 
