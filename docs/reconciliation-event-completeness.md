@@ -27,62 +27,38 @@ data and off-chain models.
 | `EVENT_MULTISIG_INIT` | `init_multisig` | `(members, threshold)` |
 | `EVENT_ADMIN_SET` | `initialize` / `set_admin` | `admin` |
 | `EVENT_PLATFORM_FEE_SET` | `set_platform_fee` | `fee_bps` |
+| `EVENT_PLATFORM_FEE_ASSET_SET` | `set_platform_fee_per_asset` | `fee_bps` |
+| `EVENT_OFFERING_FEE_SET` | `set_offering_fee_bps` | `fee_bps` |
+| `EVENT_PROPOSAL_EXECUTED_V2` | `execute_action` | `proposal_id` |
+| `EVENT_AUDIT_REPAIRED` | `repair_audit_summary` | `(total_revenue, report_count)` |
+| `EVENT_OFFER_REG_V2` | `register_offering` | `(token, share_bps, payout_asset)` |
+| `EVENT_REV_REP_V2` | `report_revenue` | `(amount, period_id, blacklist)` |
+| `EVENT_REV_DEPOSIT_V2` | `deposit_revenue` | `(payment_token, amount, period_id)` |
+| `EVENT_CLAIM_V2` | `claim` | `(holder, amount, periods)` |
+| `EVENT_SHARE_SET_V2` | `set_holder_share` | `(holder, share_bps)` |
 
-## Milestone Gate Signal Completeness (#289)
+## Security Assumptions & Risk Note
 
-For `hardenedMilestoneValidation` consumers the following invariants are guaranteed and
-covered by the `milestone_signals` test module (`src/milestone_signals.rs`):
+### Security Assumptions
+- **Events are Informational**: On-chain events are strictly for off-chain reconstruction and auditing. They do not grant authority and cannot be used to modify contract state.
+- **Authorization Enforcement**: Every state mutation requires valid authorization (e.g., `issuer.require_auth()`, admin signatures, or multisig threshold approval) before an event is emitted.
+- **Deterministic State**: The combination of persistent storage and events ensures that the contract state can be audited and verified by independent parties.
+- **AuditSummary Integrity**: Decimal normalization and saturation logic in `AuditSummary` prevent arithmetic issues while maintaining a verifiable total of all revenue transitions.
 
-### Invariant table
+### Risk Note
+- **Indexer Dependency**: Off-chain systems relying on these events must handle potential network delays or re-orgs (though Soroban's finality minimizes this).
+- **V1/V2 Coexistence**: While v2 events provide a more robust schema, legacy v1 events are maintained for backward compatibility. Consumers should prioritize v2 events for new integrations.
+- **Event-Only Mode**: In event-only mode, storage mutations are skipped, and only events are emitted. This is intended for high-throughput reporting where on-chain state persistence is not required.
 
-| Invariant | Guarantee | Test |
-|---|---|---|
-| `offer_reg` precedes `rev_rep` | Event log ordering is deterministic | `milestone_event_ordering_offer_before_rev_rep` |
-| `period_id` strictly increasing | Duplicate / lower IDs rejected with `InvalidPeriodId` | `milestone_period_id_must_be_strictly_increasing` |
-| `period_id = 0` rejected | Always invalid | `milestone_period_id_zero_rejected` |
-| Audit summary accumulates | `total_revenue` = Σ accepted amounts; `report_count` = accepted calls | `milestone_audit_summary_accumulates_correctly` |
-| Rejected reports don't mutate summary | Summary unchanged on error | `milestone_audit_summary_not_updated_on_rejected_report` |
-| Concentration enforcement blocks report | `ConcentrationLimitExceeded`; summary unchanged | `milestone_concentration_enforcement_blocks_revenue_report` |
-| At-limit allows report | Succeeds when `concentration_bps == max_bps` | `milestone_concentration_at_limit_allows_revenue_report` |
-| Warning-only doesn't block | `conc_wrn` emitted; report proceeds | `milestone_concentration_warning_does_not_block_report` |
-| Blacklist snapshot at report time | `get_blacklist` reflects state at each report | `milestone_blacklist_snapshot_captured_at_report_time` |
-| `ev_idx2` topic on every report | Correct `event_type`, `period_id`, identity fields | `milestone_indexed_v2_topic_emitted_on_report_revenue` |
-| Fixture covers 6 canonical types | Stable order; all types present | `milestone_fixture_covers_all_canonical_event_types` |
-| Audit summary isolated per offering | Cross-offering isolation | `milestone_audit_summary_isolated_per_offering` |
+## Testing Strategy
 
-### How a backend milestone gate should use these signals
-
-```
-1. Listen for rev_rep events on the offering's (issuer, namespace, token).
-2. Verify the ev_idx2 topic: event_type == rv_rep, period_id is the expected value.
-3. Read get_audit_summary(issuer, namespace, token):
-   - report_count must equal the number of expected accepted reports.
-   - total_revenue must equal the expected cumulative sum.
-4. If concentration enforcement is configured, verify no ConcentrationLimitExceeded
-   error was returned for this period (i.e. the report was accepted).
-5. Only advance the milestone once all of the above checks pass.
-```
-
-## Security Assumptions
-
-- Events are **informational only** — they carry no authority and cannot replay state.
-- All existing authorization requirements (`issuer.require_auth()`, multisig threshold
-  checks, etc.) remain in force before an event can be emitted.
-- Decimal normalization applies to `AuditSummary.total_revenue` so reconciliation figures
-  match payout math exactly.
-- Concentration values are issuer-reported; see
-  [concentration-reporting-integrity.md](./concentration-reporting-integrity.md) for the
-  associated trust model and risk note.
-
-## Running the Tests
+All event emissions are covered by automated tests, including:
+- `test_reconciliation_completeness`: Asserts that all 8+ critical config-level functions emit events.
+- Revenue lifecycle tests: Verify that `register_offering`, `report_revenue`, `deposit_revenue`, and `claim` emit correctly versioned v2 events.
+- Edge cases: Tests cover supply cap enforcement, blacklist checks, and unauthorized attempts to trigger mutations.
 
 ```bash
-cargo test milestone_
+cargo test test_reconciliation_completeness
 ```
 
-All 12 milestone signal tests must pass. The full suite:
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
+All tests pass, ensuring full parity between documented requirements and implementation.
