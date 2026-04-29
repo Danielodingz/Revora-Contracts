@@ -19,3 +19,5 @@ proptest = "1.4.0"
 opt-level = "z"
 overflow-checks = true
 
+[workspace]
+
