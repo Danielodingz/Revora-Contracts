@@ -197,6 +197,7 @@ mod test_snapshot_finalization;
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
+#[allow(clippy::enum_variant_names)]
 pub enum PauseState {
     NotPaused = 0,
     SoftPaused = 1,
@@ -6968,6 +6969,197 @@ mod issue_370_373_tests {
         assert_eq!(
             client.compute_share(&i128::MIN, &10_000, &RoundingMode::RoundHalfUp),
             i128::MIN
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_414_supply_cap_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
+
+    fn setup_with_payment_token(
+        mint_amount: i128,
+    ) -> (Env, Address, RevoraRevenueShareClient<'static>, Address, Symbol, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+        let issuer = Address::generate(&env);
+        let namespace = Symbol::new(&env, "def");
+        let token_addr = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let payment_token_admin = token::StellarAssetClient::new(&env, &payment_token.address());
+        payment_token_admin.mint(&issuer, &mint_amount);
+
+        (env, contract_id, client, issuer, namespace, token_addr, payment_token.address())
+    }
+
+    #[test]
+    fn supply_cap_zero_is_unset_and_not_enforced() {
+        let (_env, _contract_id, client, issuer, namespace, token_addr, payment_token) =
+            setup_with_payment_token(2_000_000);
+
+        assert_eq!(
+            client.try_register_offering(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &1_000,
+                &payment_token,
+                &0
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_supply_cap(&issuer, &namespace, &token_addr), 0);
+
+        assert_eq!(
+            client.try_deposit_revenue(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &payment_token,
+                &700_000,
+                &1
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_deposit_revenue(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &payment_token,
+                &700_000,
+                &2
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_deposit_revenue(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &payment_token,
+                &600_000,
+                &3
+            ),
+            Ok(Ok(()))
+        );
+    }
+
+    #[test]
+    fn supply_cap_one_allows_exact_cap_and_rejects_next_unit() {
+        let (_env, _contract_id, client, issuer, namespace, token_addr, payment_token) =
+            setup_with_payment_token(10);
+
+        assert_eq!(
+            client.try_register_offering(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &1_000,
+                &payment_token,
+                &1
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_supply_cap(&issuer, &namespace, &token_addr), 1);
+
+        assert_eq!(
+            client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &1, &1),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &1, &2),
+            Err(Ok(RevoraError::SupplyCapExceeded))
+        );
+    }
+
+    #[test]
+    fn supply_cap_readable_large_boundary_enforced() {
+        let (_env, _contract_id, client, issuer, namespace, token_addr, payment_token) =
+            setup_with_payment_token(2_000_000);
+        let cap = 1_000_000_i128;
+
+        assert_eq!(
+            client.try_register_offering(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &1_000,
+                &payment_token,
+                &cap
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_supply_cap(&issuer, &namespace, &token_addr), cap);
+
+        assert_eq!(
+            client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &cap, &1),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &1, &2),
+            Err(Ok(RevoraError::SupplyCapExceeded))
+        );
+    }
+
+    #[test]
+    fn negative_supply_cap_rejected_on_register() {
+        let (_env, _contract_id, client, issuer, namespace, token_addr, payment_token) =
+            setup_with_payment_token(10);
+
+        assert_eq!(
+            client.try_register_offering(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &1_000,
+                &payment_token,
+                &-1_i128
+            ),
+            Err(Ok(RevoraError::InvalidAmount))
+        );
+    }
+
+    #[test]
+    fn supply_cap_saturation_near_i128_max_is_safe() {
+        let (_env, _contract_id, client, issuer, namespace, token_addr, payment_token) =
+            setup_with_payment_token(i128::MAX);
+
+        let cap = i128::MAX - 2;
+        assert_eq!(
+            client.try_register_offering(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &1_000,
+                &payment_token,
+                &cap
+            ),
+            Ok(Ok(()))
+        );
+
+        assert_eq!(
+            client.try_deposit_revenue(
+                &issuer,
+                &namespace,
+                &token_addr,
+                &payment_token,
+                &(i128::MAX - 3),
+                &1
+            ),
+            Ok(Ok(()))
+        );
+
+        assert_eq!(
+            client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &10, &2),
+            Err(Ok(RevoraError::SupplyCapExceeded))
         );
     }
 }
