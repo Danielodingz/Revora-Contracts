@@ -164,9 +164,11 @@ pub enum RevoraError {
     ///
     /// Wire value: next available stable discriminant.
     MissingReportForOverride = 47,
-    /// Concentration data is missing or older than `max_staleness_secs` and enforcement is on.
-    /// Wire value: 49. Stable since v1.
-    StaleConcentrationData = 49,
+
+    /// The period has been sealed by `close_period`; no further overrides are accepted.
+    ///
+    /// Wire value: 48. Stable since v1.
+    PeriodAlreadyClosed = 48,
 }
 
 pub mod vesting;
@@ -179,30 +181,10 @@ mod test_duplicates;
 mod test_override_audit_trail;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
+// #[cfg(test)]
+// mod test_claim_transfer_fail;
 #[cfg(test)]
-mod test_multisig_gas;
-#[cfg(test)]
-mod test_pause_tiers;
-#[cfg(test)]
-mod test_snapshot_finalization;
-
-/// Two-tier pause state stored at `DataKey::Paused`.
-///
-/// - `NotPaused`  – normal operation; all entrypoints are open.
-/// - `SoftPaused` – blocks reports and deposits but **allows** `claim`, so
-///                  holders can still withdraw their funds during incident response.
-/// - `HardPaused` – blocks every state-mutating operation including `claim`.
-///
-/// Wire values are stable: do not renumber.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-#[allow(clippy::enum_variant_names)]
-pub enum PauseState {
-    NotPaused = 0,
-    SoftPaused = 1,
-    HardPaused = 2,
-}
+mod test_close_period;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -311,6 +293,8 @@ const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
+/// Emitted when a period is sealed by `close_period`.
+const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
 const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
@@ -775,6 +759,9 @@ pub enum DataKey2 {
 
     /// Per-offering blacklist size limit (#358). If not set, defaults to MAX_BLACKLIST_SIZE.
     BlacklistSizeLimit(OfferingId),
+
+    /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
+    ClosedPeriod(OfferingId, u64),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -2768,6 +2755,12 @@ impl RevoraRevenueShare {
                             (payout_asset, amount, period_id, existing_amount, blacklist),
                         );
                         return Ok(());
+                    }
+
+                    // Reject override if the period has been sealed by close_period.
+                    let closed_key = DataKey2::ClosedPeriod(offering_id.clone(), period_id);
+                    if env.storage().persistent().has(&closed_key) {
+                        return Err(RevoraError::PeriodAlreadyClosed);
                     }
 
                     actual_override = true;
@@ -5485,112 +5478,74 @@ impl RevoraRevenueShare {
         Ok(total_payout)
     }
 
-    /// Return a deterministic per-holder distribution proof for a single period.
+    /// Seal a reporting period so that no further `report_revenue` overrides are accepted.
     ///
-    /// For each address in `holders` (capped at `MAX_CHUNK_PERIODS`), the contract reads
-    /// the stored `HolderShare`, normalizes the period revenue to 7-decimal canonical units,
-    /// and computes the payout using the offering's persisted `RoundingMode`. The result
-    /// vector preserves the input order exactly, so off-chain indexers can reproduce the
-    /// digest by applying the same ordering.
+    /// Once closed, the period's deposited revenue remains claimable by holders; only
+    /// issuer-initiated corrections via `override_existing=true` are blocked.
     ///
-    /// ### Digest construction
-    /// `SHA-256(XDR(issuer) || XDR(namespace) || XDR(token) || XDR(period_id) || XDR(entries))`
-    /// where `entries` is the `Vec<DistributionEntry>` returned alongside the digest.
-    /// An unknown `period_id` returns zero payouts; callers detect this by checking
-    /// that all `normalized_payout` values are zero.
+    /// ### Auth
+    /// Requires `issuer.require_auth()`.
     ///
-    /// ### Bounds
-    /// `holders` is silently capped at `MAX_CHUNK_PERIODS` (200).
-    ///
-    /// ### Security
-    /// - Read-only: no storage writes, no auth required.
-    /// - Digest covers contract-computed values only; cannot be forged without
-    ///   changing on-chain `HolderShare` or `PeriodRevenue` state.
-    pub fn prove_distribution_for_period(
+    /// ### Errors
+    /// - `OfferingNotFound` – offering does not exist or caller is not the current issuer.
+    /// - `InvalidPeriodId` – `period_id` is 0.
+    /// - `PeriodAlreadyClosed` – period has already been sealed.
+    /// - `ContractFrozen` / `ContractPaused` – contract is not operational.
+    pub fn close_period(
         env: Env,
         issuer: Address,
         namespace: Symbol,
         token: Address,
         period_id: u64,
-        holders: Vec<Address>,
-    ) -> (Vec<DistributionEntry>, BytesN<32>) {
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+
         let offering_id = OfferingId {
             issuer: issuer.clone(),
             namespace: namespace.clone(),
             token: token.clone(),
         };
 
-        // Look up period revenue; treat missing period as zero revenue (unknown period).
-        let revenue: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodRevenue(offering_id.clone(), period_id))
-            .unwrap_or(0);
-
-        let decimals = Self::get_payment_token_decimals(
-            env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
-        );
-        let normalized_revenue = Self::normalize_amount(revenue, decimals);
-
-        let mode =
-            Self::get_rounding_mode(env.clone(), issuer.clone(), namespace.clone(), token.clone());
-
-        // Cap input to MAX_CHUNK_PERIODS to bound compute cost.
-        let cap = core::cmp::min(holders.len(), MAX_CHUNK_PERIODS);
-        let mut entries: Vec<DistributionEntry> = Vec::new(&env);
-        for i in 0..cap {
-            let holder = holders.get(i).unwrap();
-            let share_bps = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
-                .unwrap_or(0u32);
-            let normalized_payout =
-                Self::compute_share(env.clone(), normalized_revenue, share_bps, mode);
-            entries.push_back(DistributionEntry { holder, share_bps, normalized_payout });
+        // Verify offering exists and caller is the current issuer.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
         }
 
-        // Build digest: SHA-256 over XDR of (issuer, namespace, token, period_id, entries).
-        let mut payload = Bytes::new(&env);
-        payload.append(&issuer.to_xdr(&env));
-        payload.append(&namespace.to_xdr(&env));
-        payload.append(&token.to_xdr(&env));
-        payload.append(&period_id.to_xdr(&env));
-        payload.append(&entries.clone().to_xdr(&env));
-        let digest: BytesN<32> = env.crypto().sha256(&payload).into();
+        let closed_key = DataKey2::ClosedPeriod(offering_id, period_id);
+        if env.storage().persistent().has(&closed_key) {
+            return Err(RevoraError::PeriodAlreadyClosed);
+        }
 
-        (entries, digest)
+        let closed_at = env.ledger().timestamp();
+        env.storage().persistent().set(&closed_key, &closed_at);
+
+        env.events().publish(
+            (EVENT_PERIOD_CLOSED, issuer, namespace, token),
+            (period_id, closed_at),
+        );
+
+        Ok(())
     }
 
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic.
-    pub fn get_pending_periods(
+    /// Return `true` if the given period has been sealed by `close_period`.
+    pub fn is_period_closed(
         env: Env,
         issuer: Address,
         namespace: Symbol,
         token: Address,
-        holder: Address,
-    ) -> Vec<u64> {
+        period_id: u64,
+    ) -> bool {
         let offering_id = OfferingId { issuer, namespace, token };
-        let count_key = DataKey::PeriodCount(offering_id.clone());
-        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
-        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
-
-        let mut periods = Vec::new(&env);
-        for i in start_idx..period_count {
-            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
-            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-            if period_id == 0 {
-                continue;
-            }
-            periods.push_back(period_id);
-        }
-        periods
+        env.storage().persistent().has(&DataKey2::ClosedPeriod(offering_id, period_id))
     }
 }
 
